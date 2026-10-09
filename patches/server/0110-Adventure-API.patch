@@ -773,10 +773,16 @@ diff --git a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java b
 index 82ad58bc282f523548d3318c4e52fc1e3cbf7bcc..2b05648ba22a47f7579f64deabbf38132350c0fe 100644
 --- a/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
 +++ b/src/main/java/org/bukkit/craftbukkit/event/CraftEventFactory.java
-@@ -392,7 +392,7 @@ public class CraftEventFactory {
+@@ -392,7 +392,13 @@ public class CraftEventFactory {
          return event;
      }
  
++    // PandaSpigot start - Adventure legacy compatibility
++    public static PlayerDeathEvent callPlayerDeathEvent(EntityPlayer victim, List<org.bukkit.inventory.ItemStack> drops, String deathMessage, boolean keepInventory) {
++        return callPlayerDeathEvent(victim, drops, deathMessage == null ? net.kyori.adventure.text.Component.empty() : net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer.legacySection().deserialize(deathMessage), keepInventory);
++    }
++    // PandaSpigot end
++
 -    public static PlayerDeathEvent callPlayerDeathEvent(EntityPlayer victim, List<org.bukkit.inventory.ItemStack> drops, String deathMessage, boolean keepInventory) {
 +    public static PlayerDeathEvent callPlayerDeathEvent(EntityPlayer victim, List<org.bukkit.inventory.ItemStack> drops, net.kyori.adventure.text.Component deathMessage, boolean keepInventory) { // PandaSpigot - Adventure
          CraftPlayer entity = victim.getBukkitEntity();

@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Fri, 9 Oct 2026 20:40:52 +0800
+Subject: [PATCH] fix(scheduler): preserve same-tick task submission order
+
+
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+index f036709c4895639d6f3af764c209e1caa643d5dd..8dde408c411bc52cf5b250466859de494d11f78d 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftScheduler.java
+@@ -49,6 +49,7 @@ public class CraftScheduler implements BukkitScheduler {
+      * Counter for IDs. Order doesn't matter, only uniqueness.
+      */
+     private final AtomicInteger ids = new AtomicInteger(1);
++    private long nextQueueOrder; // PandaSpigot
+     /**
+      * Current head of linked-list. This reference is always stale, {@link CraftTask#next} is the live reference.
+      */
+@@ -63,7 +64,10 @@ public class CraftScheduler implements BukkitScheduler {
+     private final PriorityQueue<CraftTask> pending = new PriorityQueue<CraftTask>(10,
+             new Comparator<CraftTask>() {
+                 public int compare(final CraftTask o1, final CraftTask o2) {
+-                    return (int) (o1.getNextRun() - o2.getNextRun());
++                    // PandaSpigot start - Keep same-tick tasks in queue order
++                    int nextRun = Long.compare(o1.getNextRun(), o2.getNextRun());
++                    return nextRun != 0 ? nextRun : Long.compare(o1.queueOrder, o2.queueOrder);
++                    // PandaSpigot end
+                 }
+             });
+     /**
+@@ -420,6 +424,7 @@ public class CraftScheduler implements BukkitScheduler {
+             if (task.getTaskId() == -1) {
+                 task.run();
+             } else if (task.getPeriod() >= -1l) {
++                task.queueOrder = nextQueueOrder++; // PandaSpigot
+                 pending.add(task);
+                 runners.put(task.getTaskId(), task);
+             }
+diff --git a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftTask.java b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftTask.java
+index 4b1e352361e8f92f34901b23ff4326f0ec5cbd14..bed9b1e2b06d0e62148bd791ca5b1cafdda4a5e8 100644
+--- a/src/main/java/org/bukkit/craftbukkit/scheduler/CraftTask.java
++++ b/src/main/java/org/bukkit/craftbukkit/scheduler/CraftTask.java
+@@ -20,6 +20,7 @@ public class CraftTask implements BukkitTask, Runnable { // Spigot
+      */
+     private volatile long period;
+     private long nextRun;
++    long queueOrder; // PandaSpigot
+     public final Runnable task; //Spigot
+     public Timing timings; // Spigot
+     private final Plugin plugin;
+diff --git a/src/test/java/org/bukkit/craftbukkit/scheduler/CraftSchedulerTest.java b/src/test/java/org/bukkit/craftbukkit/scheduler/CraftSchedulerTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..6bb8cf3eeb2b5763994d11d50cdad77a9e0c986f
+--- /dev/null
++++ b/src/test/java/org/bukkit/craftbukkit/scheduler/CraftSchedulerTest.java
+@@ -0,0 +1,59 @@
++package org.bukkit.craftbukkit.scheduler;
++
++import java.lang.reflect.Proxy;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import org.bukkit.plugin.Plugin;
++import org.bukkit.scheduler.BukkitTask;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++
++public class CraftSchedulerTest {
++    private final Plugin plugin = (Plugin) Proxy.newProxyInstance(Plugin.class.getClassLoader(), new Class<?>[]{Plugin.class}, (proxy, method, args) -> {
++        if (method.getName().equals("isEnabled")) return true;
++        if (method.getName().equals("getName")) return "SchedulerTest";
++        throw new UnsupportedOperationException(method.toString());
++    });
++
++    @Test
++    public void sameTickTasksPreserveSubmissionOrder() {
++        CraftScheduler scheduler = new CraftScheduler();
++        List<Integer> expected = new ArrayList<>();
++        List<Integer> actual = new ArrayList<>();
++        for (int index = 0; index < 32; index++) {
++            final int packet = index;
++            expected.add(packet);
++            untimed(scheduler.runTask(plugin, () -> actual.add(packet)));
++        }
++
++        scheduler.mainThreadHeartbeat(0);
++
++        assertEquals(expected, actual);
++    }
++
++    @Test
++    public void delayedAndRepeatedTasksKeepTheirDueTicks() {
++        CraftScheduler scheduler = new CraftScheduler();
++        List<String> actual = new ArrayList<>();
++        BukkitTask repeating = untimed(scheduler.runTaskTimer(plugin, () -> actual.add("repeat"), 1, 2));
++        untimed(scheduler.runTaskLater(plugin, () -> actual.add("later"), 3));
++        untimed(scheduler.runTask(plugin, () -> actual.add("now")));
++
++        scheduler.mainThreadHeartbeat(0);
++        assertEquals(Arrays.asList("now", "repeat"), actual);
++        scheduler.mainThreadHeartbeat(1);
++        assertEquals(Arrays.asList("now", "repeat"), actual);
++        scheduler.mainThreadHeartbeat(2);
++        assertEquals(Arrays.asList("now", "repeat", "repeat", "later"), actual);
++        scheduler.cancelTask(repeating.getTaskId());
++        scheduler.mainThreadHeartbeat(4);
++        assertEquals(Arrays.asList("now", "repeat", "repeat", "later"), actual);
++    }
++
++    private static BukkitTask untimed(BukkitTask task) {
++        ((CraftTask) task).timings = null;
++        return task;
++    }
++}

@@ -1,0 +1,148 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 10 Oct 2026 19:24:12 +0800
+Subject: [PATCH] Cache timing parent and group data between resets
+
+
+diff --git a/src/main/java/co/aikar/timings/TimingHandler.java b/src/main/java/co/aikar/timings/TimingHandler.java
+index 4918a17c5a26e3afa2ed7ccad60163325ba07071..6f5d8735f97434b4fe36d56b9514bd12413ebe71 100644
+--- a/src/main/java/co/aikar/timings/TimingHandler.java
++++ b/src/main/java/co/aikar/timings/TimingHandler.java
+@@ -51,6 +51,12 @@ class TimingHandler implements Timing {
+     boolean timed;
+     boolean enabled;
+     TimingHandler parent;
++    private long childrenVersion;
++    private TimingHandler cachedParent;
++    private long cachedParentVersion;
++    private TimingData parentData;
++    private long cachedGroupVersion;
++    private TimingData groupData;
+ 
+     TimingHandler(TimingIdentifier id) {
+         if (id.name.startsWith("##")) {
+@@ -131,7 +137,12 @@ class TimingHandler implements Timing {
+         if (TimingsManager.CURRENT == this) {
+             TimingsManager.CURRENT = parent;
+             if (parent != null) {
+-                parent.children.get(id).add(diff);
++                if (cachedParent != parent || cachedParentVersion != parent.childrenVersion || parentData == null) {
++                    cachedParent = parent;
++                    cachedParentVersion = parent.childrenVersion;
++                    parentData = parent.children.get(id);
++                }
++                parentData.add(diff);
+             }
+         }
+         record.add(diff);
+@@ -142,7 +153,11 @@ class TimingHandler implements Timing {
+         }
+         if (groupHandler != null) {
+             groupHandler.addDiff(diff);
+-            groupHandler.children.get(id).add(diff);
++            if (groupData == null || cachedGroupVersion != groupHandler.childrenVersion) {
++                cachedGroupVersion = groupHandler.childrenVersion;
++                groupData = groupHandler.children.get(id);
++            }
++            groupData.add(diff);
+         }
+     }
+ 
+@@ -160,6 +175,10 @@ class TimingHandler implements Timing {
+         timingDepth = 0;
+         added = false;
+         children.clear();
++        childrenVersion++;
++        cachedParent = null;
++        parentData = null;
++        groupData = null;
+         checkEnabled();
+     }
+ 
+diff --git a/src/test/java/co/aikar/timings/TimingHandlerTest.java b/src/test/java/co/aikar/timings/TimingHandlerTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..f1a4f50db768de05a955ec3a48323955ca74d1c1
+--- /dev/null
++++ b/src/test/java/co/aikar/timings/TimingHandlerTest.java
+@@ -0,0 +1,81 @@
++package co.aikar.timings;
++
++import org.junit.After;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class TimingHandlerTest {
++    @After
++    public void clearCurrent() {
++        TimingsManager.CURRENT = null;
++    }
++
++    private TimingHandler handler(String name, TimingHandler group) {
++        return new TimingHandler(new TimingIdentifier("test", name, group, false));
++    }
++
++    private void record(TimingHandler child, TimingHandler parent, long diff) {
++        child.parent = parent;
++        TimingsManager.CURRENT = child;
++        child.addDiff(diff);
++        assertSame(parent != null && parent == child.groupHandler ? parent.parent : parent, TimingsManager.CURRENT);
++    }
++
++    @Test
++    public void parentSwitchAndParentOnlyResetKeepChildHistory() {
++        TimingHandler first = handler("first", null);
++        TimingHandler second = handler("second", null);
++        TimingHandler child = handler("child", null);
++        record(child, first, 10);
++        record(child, second, 20);
++        record(child, first, 30);
++        assertEquals(40, first.children.get(child.id).curTickTotal);
++        assertEquals(20, second.children.get(child.id).curTickTotal);
++        TimingData old = first.children.get(child.id);
++        first.reset(false);
++        record(child, first, 50);
++        assertNotSame(old, first.children.get(child.id));
++        assertEquals(40, old.curTickTotal);
++        assertEquals(50, first.children.get(child.id).curTickTotal);
++        first.children.get(child.id).processTick(true);
++        assertEquals(50, first.children.get(child.id).lagTotalTime);
++        assertEquals(1, first.children.get(child.id).count);
++    }
++
++    @Test
++    public void groupResetAndSharedParentPreserveBothContributions() {
++        TimingHandler group = handler("group", null);
++        TimingHandler child = handler("group-child", group);
++        record(child, group, 10);
++        assertEquals(20, group.children.get(child.id).curTickTotal);
++        assertEquals(10, group.record.curTickTotal);
++        TimingData old = group.children.get(child.id);
++        group.reset(true);
++        record(child, group, 30);
++        assertNotSame(old, group.children.get(child.id));
++        assertEquals(60, group.children.get(child.id).curTickTotal);
++        assertEquals(30, group.record.curTickTotal);
++        child.reset(true);
++        record(child, null, 40);
++        assertEquals(100, group.children.get(child.id).curTickTotal);
++        assertEquals(40, child.record.curTickTotal);
++    }
++
++    @Test
++    public void nestedStartAndAbortDoNotCreateChildData() {
++        TimingHandler parent = handler("abort-parent", null);
++        TimingHandler child = handler("abort-child", null);
++        child.enabled = true;
++        TimingsManager.CURRENT = parent;
++        child.startTiming();
++        child.startTiming();
++        assertSame(parent, child.parent);
++        assertEquals(2, child.timingDepth);
++        child.abort();
++        child.stopTiming();
++        child.stopTiming();
++        assertTrue(parent.children.isEmpty());
++        assertEquals(0, child.record.curTickCount);
++    }
++}

@@ -20,6 +20,23 @@ Fork of Paper for 1.8.8 focused on improved performance and stability.
 
 See a full list of patches [here](./patches/).
 
+### Automatic chunk saving
+
+`pandaspigot.yml` controls the global work budget shared by all worlds:
+
+```yaml
+autoSaveMaxMillisPerTick: 2.0
+autoSaveMaxChunksPerTick: 24
+```
+
+Both values must be positive. The chunk limit includes checking chunks that do
+not need saving. The existing `ticks-per.autosave` interval starts each save
+cycle; unfinished cycles retain their progress and coalesce another request.
+The time budget is checked between chunks, so one chunk snapshot or the initial
+loaded-chunk reference snapshot can exceed it. Player and world metadata saving
+keep their existing scheduling. Explicit saves, chunk/world unloads and shutdown
+keep the existing complete save and flush paths.
+
 ## Using
 You can download the latest pre-built server JAR by clicking the download button below.  
 [![Download](https://custom-icon-badges.demolab.com/badge/-Download-blue?style=for-the-badge&logo=download&logoColor=white)](https://downloads.hpfxd.com/v2/projects/pandaspigot/versions/1.8.8/builds/latest/downloads/paperclip)

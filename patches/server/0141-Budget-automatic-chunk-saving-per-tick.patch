@@ -1,0 +1,442 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Tue, 13 Oct 2026 14:10:53 +0800
+Subject: [PATCH] Budget automatic chunk saving per tick
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index c63cd15c13b503d91ef0245ffe0de7f85dd6f540..f96b68d33266cdc73250bb89745b23a086b170d0 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -47,6 +47,10 @@ public class PandaSpigotConfig {
+         try {
+             CommentedConfigurationNode root = loader.load();
+             config = root.get(PandaSpigotConfig.class);
++            if (!Double.isFinite(config.autoSaveMaxMillisPerTick) || config.autoSaveMaxMillisPerTick <= 0
++                    || config.autoSaveMaxChunksPerTick <= 0) {
++                throw new IllegalArgumentException("autoSaveMaxMillisPerTick and autoSaveMaxChunksPerTick must be positive");
++            }
+             
+             // worlds
+             CommentedConfigurationNode worldsNode = root.node("worlds")
+@@ -130,4 +134,8 @@ public class PandaSpigotConfig {
+ 
+     @Comment("Protect spawn from explosions")
+     public boolean betterSpawnProtection = true;
++
++    public double autoSaveMaxMillisPerTick = 2.0;
++
++    public int autoSaveMaxChunksPerTick = 24;
+ }
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index 041ede2857ddcc6fc8a4f52318ef4ba9d975782a..ff03b0505a8db27b00ce6525b007aa72e4e1fed2 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -36,6 +36,11 @@ public class ChunkProviderServer implements IChunkProvider {
+     public boolean forceChunkLoad = false; // CraftBukkit - true -> false
+     public LongObjectHashMap<Chunk> chunks = new LongObjectHashMap<Chunk>();
+     public WorldServer world;
++    // PandaSpigot start - Tick-budgeted automatic saving
++    private Chunk[] automaticSaveChunks;
++    private int automaticSaveIndex;
++    private boolean automaticSaveRequested;
++    // PandaSpigot end
+ 
+     public ChunkProviderServer(WorldServer worldserver, IChunkLoader ichunkloader, IChunkProvider ichunkprovider) {
+         this.emptyChunk = new EmptyChunk(worldserver, Integer.MIN_VALUE, Integer.MIN_VALUE); // PandaSpigot - Occasional Client Side Unloading of 0,0 chunk
+@@ -336,6 +341,11 @@ public class ChunkProviderServer implements IChunkProvider {
+     }
+ 
+     public boolean saveChunks(boolean flag, IProgressUpdate iprogressupdate) {
++        // PandaSpigot start - Explicit saves supersede pending automatic work
++        this.automaticSaveChunks = null;
++        this.automaticSaveIndex = 0;
++        this.automaticSaveRequested = false;
++        // PandaSpigot end
+         int i = 0;
+ 
+         // CraftBukkit start
+@@ -361,6 +371,38 @@ public class ChunkProviderServer implements IChunkProvider {
+         return true;
+     }
+ 
++    // PandaSpigot start - Tick-budgeted automatic saving
++    public void startAutomaticSave() {
++        this.automaticSaveRequested = true;
++    }
++
++    public boolean saveNextAutomaticChunk() {
++        if (this.world.pandaSpigotConfig.disableChunkSaving) {
++            this.automaticSaveChunks = null;
++            this.automaticSaveIndex = 0;
++            this.automaticSaveRequested = false;
++            return false;
++        }
++        if (this.automaticSaveChunks == null) {
++            if (!this.automaticSaveRequested) return false;
++            this.automaticSaveRequested = false;
++            this.automaticSaveChunks = this.chunks.values().toArray(new Chunk[this.chunks.size()]);
++            this.automaticSaveIndex = 0;
++        }
++        if (this.automaticSaveIndex == this.automaticSaveChunks.length) {
++            this.automaticSaveChunks = null;
++            return false;
++        }
++        Chunk chunk = this.automaticSaveChunks[this.automaticSaveIndex++];
++        if (this.getChunkIfLoaded(chunk.locX, chunk.locZ) == chunk && chunk.a(false)) {
++            this.saveChunk(chunk);
++            chunk.f(false);
++        }
++        if (this.automaticSaveIndex == this.automaticSaveChunks.length) this.automaticSaveChunks = null;
++        return true;
++    }
++    // PandaSpigot end
++
+     public void c() {
+         if (this.chunkLoader != null) {
+             this.chunkLoader.b();
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index a132a29f82bc20da22ee04622fe1df513cabea70..8b8c66940effb5c12eea8a8dd38169d9ff55631d 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -117,6 +117,7 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     public final Thread primaryThread;
+     public java.util.Queue<Runnable> processQueue = new java.util.concurrent.ConcurrentLinkedQueue<Runnable>();
+     public int autosavePeriod;
++    private int automaticSaveWorldIndex; // PandaSpigot - Tick-budgeted automatic saving
+     // CraftBukkit end
+     // PandaSpigot start - Modern Tick Loop
+     private static final long OVERLOADED_THRESHOLD_NANOS = 20L * TimeUnit.SECONDS.toNanos(1L) / 20L;
+@@ -834,7 +835,7 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+             // Also pass flag to only save modified chunks
+             server.playerCommandState = true;
+             for (World world : worlds) {
+-                world.getWorld().save(false);
++                world.getWorld().saveAutomatically(); // PandaSpigot - Tick-budgeted automatic saving
+             }
+             server.playerCommandState = false;
+             // this.saveChunks(true);
+@@ -843,6 +844,17 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+             SpigotTimings.worldSaveTimer.stopTiming(); // Spigot
+         }
+ 
++        // PandaSpigot start - Tick-budgeted automatic saving
++        SpigotTimings.worldSaveTimer.startTiming();
++        server.playerCommandState = true;
++        try {
++            this.saveAutomaticChunks();
++        } finally {
++            server.playerCommandState = false;
++            SpigotTimings.worldSaveTimer.stopTiming();
++        }
++        // PandaSpigot end
++
+         this.methodProfiler.a("tallying");
+         this.h[this.ticks % 100] = System.nanoTime() - i;
+         this.methodProfiler.b();
+@@ -866,6 +878,26 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.stopTiming(); // Spigot
+     }
+ 
++    // PandaSpigot start - Tick-budgeted automatic saving
++    private void saveAutomaticChunks() {
++        com.hpfxd.pandaspigot.config.PandaSpigotConfig config = com.hpfxd.pandaspigot.config.PandaSpigotConfig.get();
++        long start = System.nanoTime();
++        int processed = 0;
++        int idleWorlds = 0;
++        while (processed < config.autoSaveMaxChunksPerTick && idleWorlds < this.worlds.size()
++                && System.nanoTime() - start < config.autoSaveMaxMillisPerTick * 1000000.0) {
++            if (this.automaticSaveWorldIndex >= this.worlds.size()) this.automaticSaveWorldIndex = 0;
++            WorldServer world = this.worlds.get(this.automaticSaveWorldIndex++);
++            if (world.chunkProviderServer.saveNextAutomaticChunk()) {
++                processed++;
++                idleWorlds = 0;
++            } else {
++                idleWorlds++;
++            }
++        }
++    }
++    // PandaSpigot end
++
+     public void B() {
+         SpigotTimings.minecraftSchedulerTimer.startTiming(); // Spigot
+         this.methodProfiler.a("jobs");
+diff --git a/src/main/java/net/minecraft/server/WorldServer.java b/src/main/java/net/minecraft/server/WorldServer.java
+index fa64dcafc3ccb2d4c2dcfc00a5aea2c3e6cd8719..8deeaed60dd269b531264fafecc92160811f12d0 100644
+--- a/src/main/java/net/minecraft/server/WorldServer.java
++++ b/src/main/java/net/minecraft/server/WorldServer.java
+@@ -1115,6 +1115,16 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+     }
+ 
+     public void save(boolean flag, IProgressUpdate iprogressupdate) throws ExceptionWorldConflict {
++        // PandaSpigot start - Keep explicit saving synchronous
++        this.save(flag, iprogressupdate, false);
++    }
++
++    public void saveAutomatically() throws ExceptionWorldConflict {
++        this.save(false, null, true);
++    }
++
++    private void save(boolean flag, IProgressUpdate iprogressupdate, boolean automatic) throws ExceptionWorldConflict {
++        // PandaSpigot end
+         if (this.chunkProvider.canSave()) {
+             org.bukkit.Bukkit.getPluginManager().callEvent(new org.bukkit.event.world.WorldSaveEvent(getWorld())); // CraftBukkit
+             if (iprogressupdate != null) {
+@@ -1127,7 +1137,10 @@ public class WorldServer extends World /*implements IAsyncTaskHandler*/ { // Pan
+             }
+ 
+             if (!this.pandaSpigotConfig.disableChunkSaving) { // PandaSpigot - Configurable chunk saving
+-            this.chunkProvider.saveChunks(flag, iprogressupdate);
++                // PandaSpigot start - Tick-budgeted automatic saving
++                if (automatic) this.chunkProviderServer.startAutomaticSave();
++                else this.chunkProvider.saveChunks(flag, iprogressupdate);
++                // PandaSpigot end
+             } // PandaSpigot
+             /* // PandaSpigot start - Disable Vanilla Chunk GC
+             // CraftBukkit - ArrayList -> Collection
+diff --git a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+index da8164a0e797f0e747810b6b208af2e9d78e08ba..27ca35b4fb2c633497c668b729079ab338281480 100644
+--- a/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
++++ b/src/main/java/org/bukkit/craftbukkit/CraftWorld.java
+@@ -794,12 +794,25 @@ public class CraftWorld implements World {
+     }
+     public void save(boolean forceSave) {
+     // Spigot end
++        // PandaSpigot start - Separate automatic and explicit saves
++        save(forceSave, false);
++    }
++
++    public void saveAutomatically() {
++        save(false, true);
++    }
++
++    private void save(boolean forceSave, boolean automatic) {
++        // PandaSpigot end
+         this.server.checkSaveState();
+         try {
+             boolean oldSave = world.savingDisabled;
+ 
+             world.savingDisabled = false;
+-            world.save(forceSave, null); // Spigot
++            // PandaSpigot start - Preserve explicit save overrides
++            if (automatic) world.saveAutomatically();
++            else world.save(forceSave, null);
++            // PandaSpigot end
+ 
+             world.savingDisabled = oldSave;
+         } catch (ExceptionWorldConflict ex) {
+diff --git a/src/test/java/net/minecraft/server/ChunkProviderServerAutoSaveTest.java b/src/test/java/net/minecraft/server/ChunkProviderServerAutoSaveTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..da525f11e92953541feab04e3989d1dc7334f482
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/ChunkProviderServerAutoSaveTest.java
+@@ -0,0 +1,209 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
++import com.hpfxd.pandaspigot.config.PandaSpigotWorldConfig;
++import java.lang.reflect.Field;
++import java.lang.reflect.Method;
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class ChunkProviderServerAutoSaveTest extends AbstractTestingBase {
++    @Test
++    public void automaticSaveUsesCurrentStateAndSkipsUnloadedInstances() throws Exception {
++        RecordingProvider provider = provider();
++        Chunk original = chunk(provider, 0);
++        Chunk later = chunk(provider, 1);
++        provider.startAutomaticSave();
++        assertTrue(provider.saveNextAutomaticChunk());
++        Chunk pending = provider.saved.get(0) == original ? later : original;
++        provider.chunks.remove(org.bukkit.craftbukkit.util.LongHash.toLong(pending.locX, pending.locZ));
++        Chunk replacement = chunk(provider, pending.locX);
++        assertTrue(provider.saveNextAutomaticChunk());
++        assertFalse(provider.saved.contains(pending));
++        assertFalse(provider.saved.contains(replacement));
++        assertFalse(provider.saveNextAutomaticChunk());
++        provider.startAutomaticSave();
++        drain(provider);
++        assertTrue(provider.saved.contains(replacement));
++    }
++
++    @Test
++    public void changesBeforeProcessingAndOverlappingCyclesAreRetained() throws Exception {
++        RecordingProvider provider = provider();
++        Chunk first = chunk(provider, 0);
++        Chunk second = chunk(provider, 1);
++        provider.startAutomaticSave();
++        provider.saveNextAutomaticChunk();
++        Chunk saved = provider.saved.get(0);
++        Chunk pending = saved == first ? second : first;
++        pending.f(false);
++        pending.f(true);
++        saved.f(true);
++        provider.startAutomaticSave();
++        drain(provider);
++        assertEquals(3, provider.saved.size());
++        assertEquals(2, java.util.Collections.frequency(provider.saved, saved));
++        assertEquals(1, java.util.Collections.frequency(provider.saved, pending));
++    }
++
++    @Test
++    public void explicitSavesCompleteAndCancelPendingAutomaticWork() throws Exception {
++        for (boolean force : new boolean[]{false, true}) {
++            RecordingProvider provider = provider();
++            Chunk first = chunk(provider, 0);
++            Chunk second = chunk(provider, 1);
++            provider.startAutomaticSave();
++            provider.saveNextAutomaticChunk();
++            first.f(true);
++            second.f(true);
++            int before = provider.saved.size();
++            assertTrue(provider.saveChunks(force, null));
++            assertEquals(before + 2, provider.saved.size());
++            assertEquals(force ? 2 : 0, provider.extraSaves);
++            assertFalse(provider.saveNextAutomaticChunk());
++        }
++    }
++
++    @Test
++    public void disabledChunkSavingCancelsPendingWorkWithoutClearingDirtyState() throws Exception {
++        RecordingProvider provider = provider();
++        Chunk chunk = chunk(provider, 0);
++        provider.startAutomaticSave();
++        provider.world.pandaSpigotConfig.disableChunkSaving = true;
++        assertFalse(provider.saveNextAutomaticChunk());
++        assertTrue(chunk.a(false));
++        provider.world.pandaSpigotConfig.disableChunkSaving = false;
++        assertFalse(provider.saveNextAutomaticChunk());
++        provider.startAutomaticSave();
++        drain(provider);
++        assertEquals(Arrays.asList(chunk), provider.saved);
++    }
++
++    @Test
++    public void entityOnlyChunksKeepTheirAutomaticSaveInterval() throws Exception {
++        RecordingProvider provider = provider();
++        provider.world.worldData = new WorldData(new NBTTagCompound());
++        Chunk chunk = chunk(provider, 0);
++        chunk.f(false);
++        chunk.g(true);
++        DedicatedServer server = allocate(DedicatedServer.class);
++        server.autosavePeriod = 20;
++        Field serverField = MinecraftServer.class.getDeclaredField("l");
++        serverField.setAccessible(true);
++        Object previous = serverField.get(null);
++        try {
++            serverField.set(null, server);
++            provider.world.worldData.setTime(79);
++            provider.startAutomaticSave();
++            drain(provider);
++            assertTrue(provider.saved.isEmpty());
++            provider.world.worldData.setTime(80);
++            provider.startAutomaticSave();
++            drain(provider);
++            assertEquals(Arrays.asList(chunk), provider.saved);
++            provider.world.worldData.setTime(81);
++            provider.saveChunks(true, null);
++            assertEquals(2, provider.saved.size());
++        } finally {
++            serverField.set(null, previous);
++        }
++    }
++
++    @Test
++    public void serverSharesCountAndTimeBudgetsAcrossWorlds() throws Exception {
++        RecordingProvider first = provider();
++        RecordingProvider second = provider();
++        for (int index = 0; index < 4; index++) {
++            chunk(first, index);
++            chunk(second, index);
++        }
++        first.world.chunkProviderServer = first;
++        second.world.chunkProviderServer = second;
++        DedicatedServer server = allocate(DedicatedServer.class);
++        server.worlds = new ArrayList<>(Arrays.asList(first.world, second.world));
++        PandaSpigotConfig config = new PandaSpigotConfig();
++        config.autoSaveMaxMillisPerTick = 10000;
++        config.autoSaveMaxChunksPerTick = 3;
++        Field configField = PandaSpigotConfig.class.getDeclaredField("config");
++        configField.setAccessible(true);
++        Object previous = configField.get(null);
++        Method save = MinecraftServer.class.getDeclaredMethod("saveAutomaticChunks");
++        save.setAccessible(true);
++        try {
++            configField.set(null, config);
++            first.startAutomaticSave();
++            second.startAutomaticSave();
++            save.invoke(server);
++            assertEquals(2, first.saved.size());
++            assertEquals(1, second.saved.size());
++            save.invoke(server);
++            assertEquals(3, first.saved.size());
++            assertEquals(3, second.saved.size());
++            config.autoSaveMaxMillisPerTick = 10;
++            first.delayMillis = second.delayMillis = 50;
++            save.invoke(server);
++            assertEquals(7, first.saved.size() + second.saved.size());
++            save.invoke(server);
++            assertEquals(8, first.saved.size() + second.saved.size());
++        } finally {
++            configField.set(null, previous);
++        }
++    }
++
++    private static RecordingProvider provider() throws Exception {
++        WorldServer world = allocate(WorldServer.class);
++        world.pandaSpigotConfig = new PandaSpigotWorldConfig();
++        return new RecordingProvider(world);
++    }
++
++    private static Chunk chunk(RecordingProvider provider, int x) {
++        Chunk chunk = new Chunk(provider.world, x, 0);
++        chunk.f(true);
++        provider.chunks.put(org.bukkit.craftbukkit.util.LongHash.toLong(x, 0), chunk);
++        return chunk;
++    }
++
++    private static void drain(RecordingProvider provider) {
++        int remaining = 20;
++        while (provider.saveNextAutomaticChunk()) assertTrue(--remaining > 0);
++    }
++
++    private static <T> T allocate(Class<T> type) throws Exception {
++        Class<?> unsafe = Class.forName("sun.misc.Unsafe");
++        Field field = unsafe.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        return type.cast(unsafe.getMethod("allocateInstance", Class.class).invoke(field.get(null), type));
++    }
++
++    private static final class RecordingProvider extends ChunkProviderServer {
++        final List<Chunk> saved = new ArrayList<>();
++        int extraSaves;
++        long delayMillis;
++
++        RecordingProvider(WorldServer world) {
++            super(world, null, null);
++        }
++
++        @Override
++        public void saveChunk(Chunk chunk) {
++            saved.add(chunk);
++            if (delayMillis > 0) {
++                try {
++                    Thread.sleep(delayMillis);
++                } catch (InterruptedException exception) {
++                    throw new AssertionError(exception);
++                }
++            }
++        }
++
++        @Override
++        public void saveChunkNOP(Chunk chunk) {
++            extraSaves++;
++        }
++    }
++}

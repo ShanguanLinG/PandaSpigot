@@ -1,0 +1,20 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Tue, 13 Oct 2026 12:23:12 +0800
+Subject: [PATCH] Skip login texture lookup for offline profiles
+
+
+diff --git a/src/main/java/net/minecraft/server/LoginListener.java b/src/main/java/net/minecraft/server/LoginListener.java
+index db892152d785b2f1badd12c7062221220961821b..ddaa5c935b614d2fe1dfef410454ab3421019def 100644
+--- a/src/main/java/net/minecraft/server/LoginListener.java
++++ b/src/main/java/net/minecraft/server/LoginListener.java
+@@ -261,7 +261,8 @@ public class LoginListener implements PacketLoginInListener, IUpdatePlayerListBo
+                             AsyncPlayerPreLoginEvent asyncEvent = new AsyncPlayerPreLoginEvent(playerName, address, uniqueId, profile);
+                             server.getPluginManager().callEvent(asyncEvent);
+                             profile = asyncEvent.getPlayerProfile();
+-                            profile.complete();
++                            UUID offlineId = UUID.nameUUIDFromBytes(("OfflinePlayer:" + profile.getName()).getBytes(Charsets.UTF_8));
++                            profile.complete(!offlineId.equals(profile.getId()));
+                             i = com.destroystokyo.paper.profile.CraftPlayerProfile.asAuthlib(profile);
+                             playerName = i.getName();
+                             uniqueId = i.getId();

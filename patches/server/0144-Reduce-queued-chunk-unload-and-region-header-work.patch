@@ -1,0 +1,389 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 15 Oct 2026 11:44:05 +0800
+Subject: [PATCH] Reduce queued chunk unload and region header work
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index d07058e5068dadf30951b59544c8447bd0678f69..4487c0c12c8e92902f28e4606e447d1f31cde50f 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -54,6 +54,7 @@ public class PandaSpigotConfig {
+             // PandaSpigot start - Bound login and chunk work
+             if (config.maxLoginsPerTick <= 0 || !Double.isFinite(config.loginMaxMillisPerTick) || config.loginMaxMillisPerTick <= 0
+                     || config.chunkIoMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkIoMaxMillisPerTick) || config.chunkIoMaxMillisPerTick <= 0
++                    || config.chunkUnloadMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkUnloadMaxMillisPerTick) || config.chunkUnloadMaxMillisPerTick <= 0
+                     || config.chunkSendMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkSendMaxMillisPerTick) || config.chunkSendMaxMillisPerTick <= 0) {
+                 throw new IllegalArgumentException("Login and chunk work count and time limits must be positive");
+             }
+@@ -151,6 +152,8 @@ public class PandaSpigotConfig {
+     public double loginMaxMillisPerTick = 6.0;
+     public int chunkIoMaxChunksPerTick = 64;
+     public double chunkIoMaxMillisPerTick = 4.0;
++    public int chunkUnloadMaxChunksPerTick = 100;
++    public double chunkUnloadMaxMillisPerTick = 2.0;
+     public int chunkSendMaxChunksPerTick = 256;
+     public double chunkSendMaxMillisPerTick = 4.0;
+     // PandaSpigot end
+diff --git a/src/main/java/net/minecraft/server/ChunkProviderServer.java b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+index ff03b0505a8db27b00ce6525b007aa72e4e1fed2..315dd5b63e9fce4a96fa3b638c0af481730841da 100644
+--- a/src/main/java/net/minecraft/server/ChunkProviderServer.java
++++ b/src/main/java/net/minecraft/server/ChunkProviderServer.java
+@@ -1,5 +1,8 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.TickWorkBudget;
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
++
+ import com.google.common.collect.Lists;
+ import java.io.IOException;
+ import java.util.ArrayList;
+@@ -33,6 +36,7 @@ public class ChunkProviderServer implements IChunkProvider {
+     public Chunk emptyChunk;
+     public IChunkProvider chunkProvider;
+     private IChunkLoader chunkLoader;
++    private static final TickWorkBudget unloadBudget = new TickWorkBudget(); // PandaSpigot
+     public boolean forceChunkLoad = false; // CraftBukkit - true -> false
+     public LongObjectHashMap<Chunk> chunks = new LongObjectHashMap<Chunk>();
+     public WorldServer world;
+@@ -410,44 +414,56 @@ public class ChunkProviderServer implements IChunkProvider {
+ 
+     }
+ 
++    // PandaSpigot start - Share automatic unload work across all worlds
++    static void beginUnloadTick() {
++        PandaSpigotConfig config = PandaSpigotConfig.get();
++        unloadBudget.reset(config.chunkUnloadMaxChunksPerTick, (long) (config.chunkUnloadMaxMillisPerTick * 1_000_000L));
++    }
++    // PandaSpigot end
++
+     public boolean unloadChunks() {
+         if (!this.world.savingDisabled) {
+             // CraftBukkit start
+             Server server = this.world.getServer();
+-            for (int i = 0; i < 100 && !this.unloadQueue.isEmpty(); ++i) {
+-                long chunkcoordinates = this.unloadQueue.popFirst();
+-                Chunk chunk = this.chunks.get(chunkcoordinates);
+-                if (chunk == null) continue;
+-
+-                ChunkUnloadEvent event = new ChunkUnloadEvent(chunk.bukkitChunk);
+-                server.getPluginManager().callEvent(event);
+-                if (!event.isCancelled()) {
+-
+-                    // PandaSpigot start - Remove duplicate null check for chunk in unloadChunks method
+-                    // if (chunk != null) {
+-                        chunk.removeEntities();
+-                        this.saveChunk(chunk);
+-                        this.saveChunkNOP(chunk);
+-                        this.chunks.remove(chunkcoordinates); // CraftBukkit
+-                    // }
+-                    // PandaSpigot end
+-
+-                    // this.unloadQueue.remove(olong);
+-
+-                    // Update neighbor counts
+-                    for (int x = -2; x < 3; x++) {
+-                        for (int z = -2; z < 3; z++) {
+-                            if (x == 0 && z == 0) {
+-                                continue;
+-                            }
+-
+-                            Chunk neighbor = this.getChunkIfLoaded(chunk.locX + x, chunk.locZ + z);
+-                            if (neighbor != null) {
+-                                neighbor.setNeighborUnloaded(-x, -z);
+-                                chunk.setNeighborUnloaded(x, z);
++            for (int i = 0; i < 100 && !this.unloadQueue.isEmpty() && unloadBudget.hasRemaining(); ++i) { // PandaSpigot
++                long started = System.nanoTime(); // PandaSpigot
++                try { // PandaSpigot
++                    long chunkcoordinates = this.unloadQueue.popFirst();
++                    Chunk chunk = this.chunks.get(chunkcoordinates);
++                    if (chunk == null) continue;
++
++                    ChunkUnloadEvent event = new ChunkUnloadEvent(chunk.bukkitChunk);
++                    server.getPluginManager().callEvent(event);
++                    if (!event.isCancelled()) {
++
++                        // PandaSpigot start - Remove duplicate null check for chunk in unloadChunks method
++                        // if (chunk != null) {
++                            chunk.removeEntities();
++                            this.saveChunk(chunk);
++                            this.saveChunkNOP(chunk);
++                            this.chunks.remove(chunkcoordinates); // CraftBukkit
++                        // }
++                        // PandaSpigot end
++
++                        // this.unloadQueue.remove(olong);
++
++                        // Update neighbor counts
++                        for (int x = -2; x < 3; x++) {
++                            for (int z = -2; z < 3; z++) {
++                                if (x == 0 && z == 0) {
++                                    continue;
++                                }
++
++                                Chunk neighbor = this.getChunkIfLoaded(chunk.locX + x, chunk.locZ + z);
++                                if (neighbor != null) {
++                                    neighbor.setNeighborUnloaded(-x, -z);
++                                    chunk.setNeighborUnloaded(x, z);
++                                }
+                             }
+                         }
+                     }
++                } finally { // PandaSpigot
++                    unloadBudget.record(1, started); // PandaSpigot
+                 }
+             }
+             // CraftBukkit end
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 0db4d8725863dc832f5f2207ed378c5e7b7dac4c..34887d4621fe3a6291e17a6d32438fe3b9e905b2 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -947,6 +947,7 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+ 
+         int i;
+ 
++        ChunkProviderServer.beginUnloadTick(); // PandaSpigot
+         for (i = 0; i < this.worlds.size(); ++i) {
+             long j = System.nanoTime();
+ 
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index 6a489b4514d565b47d930a6ed1abf94cd863cf54..1700297d1b166fc62cc46030f2a6756c7b0c8f76 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -8,6 +8,8 @@ import com.google.common.collect.Lists;
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
++import java.util.Set; // PandaSpigot
++import java.util.HashSet; // PandaSpigot
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+@@ -189,7 +191,7 @@ public class PlayerChunkMap {
+     }
+ 
+     public void b(EntityPlayer entityplayer) {
+-        ArrayList arraylist = Lists.newArrayList(entityplayer.chunkCoordIntPairQueue);
++        Set<ChunkCoordIntPair> arraylist = new HashSet<>(entityplayer.chunkCoordIntPairQueue); // PandaSpigot - Only membership is needed while retaining spiral order
+         int i = 0;
+         int j = entityplayer.viewDistance; // PaperSpigot - Player view distance API
+         int k = (int) entityplayer.locX >> 4;
+diff --git a/src/main/java/net/minecraft/server/RegionFile.java b/src/main/java/net/minecraft/server/RegionFile.java
+index 6373527a96b172e8faa5e10f8bf66c97916fd747..84dabf82aa6eca2a7b31644dad7e60f230f9d99d 100644
+--- a/src/main/java/net/minecraft/server/RegionFile.java
++++ b/src/main/java/net/minecraft/server/RegionFile.java
+@@ -23,6 +23,7 @@ public class RegionFile {
+     private RandomAccessFile c;
+     private final int[] d = new int[1024];
+     private final int[] e = new int[1024];
++    private final byte[] chunkHeader = new byte[5]; // PandaSpigot - Read the record header in one IO operation
+     private List<Boolean> f;
+     private int g;
+     private long h;
+@@ -116,13 +117,17 @@ public class RegionFile {
+                     }
+ 
+                     this.c.seek((long) (l * 4096));
+-                    int j1 = this.c.readInt();
++                    // PandaSpigot start - Batch the length and compression byte
++                    this.c.readFully(this.chunkHeader);
++                    int j1 = (this.chunkHeader[0] & 255) << 24 | (this.chunkHeader[1] & 255) << 16
++                            | (this.chunkHeader[2] & 255) << 8 | this.chunkHeader[3] & 255;
++                    // PandaSpigot end
+ 
+                     if (j1 > 4096 * i1 || j1 <= 0) {
+                         return false;
+                     }
+ 
+-                    byte b0 = this.c.readByte();
++                    byte b0 = this.chunkHeader[4]; // PandaSpigot
+                     if (b0 == 1 || b0 == 2) {
+                         return true;
+                     }
+@@ -153,14 +158,18 @@ public class RegionFile {
+                         return null;
+                     } else {
+                         this.c.seek((long) (l * 4096));
+-                        int j1 = this.c.readInt();
++                        // PandaSpigot start - Batch the length and compression byte
++                        this.c.readFully(this.chunkHeader);
++                        int j1 = (this.chunkHeader[0] & 255) << 24 | (this.chunkHeader[1] & 255) << 16
++                                | (this.chunkHeader[2] & 255) << 8 | this.chunkHeader[3] & 255;
++                        // PandaSpigot end
+ 
+                         if (j1 > 4096 * i1) {
+                             return null;
+                         } else if (j1 <= 0) {
+                             return null;
+                         } else {
+-                            byte b0 = this.c.readByte();
++                            byte b0 = this.chunkHeader[4]; // PandaSpigot
+                             byte[] abyte;
+ 
+                             if (b0 == 1) {
+diff --git a/src/test/java/net/minecraft/server/RegionFileHeaderTest.java b/src/test/java/net/minecraft/server/RegionFileHeaderTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ac21150359abbed4b5d35078295196283a5318ed
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/RegionFileHeaderTest.java
+@@ -0,0 +1,160 @@
++package net.minecraft.server;
++
++import java.io.DataInputStream;
++import java.io.ByteArrayOutputStream;
++import java.io.DataOutputStream;
++import java.io.File;
++import java.io.IOException;
++import java.io.RandomAccessFile;
++import java.lang.reflect.Field;
++import java.util.zip.GZIPOutputStream;
++
++import org.junit.Rule;
++import org.junit.Test;
++import org.junit.rules.TemporaryFolder;
++
++import static org.junit.Assert.*;
++
++public class RegionFileHeaderTest {
++    @Rule
++    public TemporaryFolder temporary = new TemporaryFolder();
++
++    @Test
++    public void headersUseOneBulkReadAndPayloadsSurviveOverwritesAndReopening() throws Exception {
++        File file = temporary.newFile();
++        RegionFile region = new RegionFile(file);
++        assertFalse(region.chunkExists(0, 0));
++        write(region, "before");
++        Field input = RegionFile.class.getDeclaredField("c");
++        input.setAccessible(true);
++        ((RandomAccessFile) input.get(region)).close();
++        CountingFile counted = new CountingFile(file);
++        input.set(region, counted);
++        try {
++            assertTrue(region.chunkExists(0, 0));
++            assertEquals(1, counted.bulkReads);
++            assertEquals(0, counted.singleReads);
++            counted.bulkReads = 0;
++            try (DataInputStream data = region.a(0, 0)) {
++                assertEquals("before", data.readUTF());
++            }
++            assertEquals(2, counted.bulkReads);
++            assertEquals(0, counted.singleReads);
++            write(region, "after");
++            assertTrue(region.chunkExists(0, 0));
++        } finally {
++            region.c();
++        }
++        RegionFile reopened = new RegionFile(file);
++        try (DataInputStream data = reopened.a(0, 0)) {
++            assertEquals("after", data.readUTF());
++            assertTrue(reopened.chunkExists(0, 0));
++        } finally {
++            reopened.c();
++        }
++    }
++
++    @Test
++    public void gzipRecordsStillValidateAndDecode() throws Exception {
++        File file = savedFile();
++        ByteArrayOutputStream compressed = new ByteArrayOutputStream();
++        try (DataOutputStream data = new DataOutputStream(new GZIPOutputStream(compressed))) {
++            data.writeUTF("gzip");
++        }
++        try (RandomAccessFile raw = new RandomAccessFile(file, "rw")) {
++            raw.seek(recordOffset(raw));
++            raw.writeInt(compressed.size() + 1);
++            raw.writeByte(1);
++            raw.write(compressed.toByteArray());
++        }
++        RegionFile region = new RegionFile(file);
++        try (DataInputStream data = region.a(0, 0)) {
++            assertTrue(region.chunkExists(0, 0));
++            assertEquals("gzip", data.readUTF());
++        } finally {
++            region.c();
++        }
++    }
++
++    @Test
++    public void invalidLengthsCompressionAndTruncatedHeadersRemainRejected() throws Exception {
++        for (int invalidLength : new int[]{0, -1, 8192}) {
++            File file = savedFile();
++            try (RandomAccessFile raw = new RandomAccessFile(file, "rw")) {
++                raw.seek(recordOffset(raw));
++                raw.writeInt(invalidLength);
++            }
++            assertRejected(file);
++        }
++        File compression = savedFile();
++        try (RandomAccessFile raw = new RandomAccessFile(compression, "rw")) {
++            raw.seek(recordOffset(raw) + 4);
++            raw.writeByte(3);
++        }
++        assertRejected(compression);
++        File truncated = savedFile();
++        try (RandomAccessFile raw = new RandomAccessFile(truncated, "rw")) {
++            raw.setLength(recordOffset(raw) + 4);
++        }
++        assertRejected(truncated);
++    }
++
++    private File savedFile() throws IOException {
++        File file = temporary.newFile();
++        RegionFile region = new RegionFile(file);
++        try {
++            write(region, "payload");
++        } finally {
++            region.c();
++        }
++        return file;
++    }
++
++    private static void write(RegionFile region, String value) throws IOException {
++        try (DataOutputStream data = region.b(0, 0)) {
++            data.writeUTF(value);
++        }
++    }
++
++    private static long recordOffset(RandomAccessFile raw) throws IOException {
++        raw.seek(0);
++        return (raw.readInt() >>> 8) * 4096L;
++    }
++
++    private static void assertRejected(File file) throws IOException {
++        RegionFile region = new RegionFile(file);
++        try {
++            assertFalse(region.chunkExists(0, 0));
++            assertNull(region.a(0, 0));
++        } finally {
++            region.c();
++        }
++    }
++
++    private static final class CountingFile extends RandomAccessFile {
++        int bulkReads;
++        int singleReads;
++
++        CountingFile(File file) throws IOException {
++            super(file, "rw");
++        }
++
++        @Override
++        public int read() throws IOException {
++            singleReads++;
++            return super.read();
++        }
++
++        @Override
++        public int read(byte[] buffer) throws IOException {
++            bulkReads++;
++            return super.read(buffer);
++        }
++
++        @Override
++        public int read(byte[] buffer, int offset, int length) throws IOException {
++            bulkReads++;
++            return super.read(buffer, offset, length);
++        }
++    }
++}

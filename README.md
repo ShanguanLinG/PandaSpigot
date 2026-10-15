@@ -46,6 +46,8 @@ maxLoginsPerTick: 4
 loginMaxMillisPerTick: 6.0
 chunkIoMaxChunksPerTick: 64
 chunkIoMaxMillisPerTick: 4.0
+chunkUnloadMaxChunksPerTick: 100
+chunkUnloadMaxMillisPerTick: 2.0
 chunkSendMaxChunksPerTick: 256
 chunkSendMaxMillisPerTick: 4.0
 ```
@@ -53,7 +55,9 @@ chunkSendMaxMillisPerTick: 4.0
 All limits must be positive. Login acceptance and delayed reconnects share the
 login budget. Completed asynchronous chunk loads retain their callbacks until
 their main-thread completion runs; synchronous chunk loads still complete
-immediately. Chunk packets rotate through players, preserve each world's
+immediately. Queued automatic unloads share their count and time limits across
+worlds; explicit Bukkit unloads and full saves retain their immediate paths.
+Chunk packets rotate through players, preserve each world's
 `max-bulk-chunks` limit, and send tile entities and tracked entities after the
 chunk packet. Budgets are checked between operations; one login, chunk
 completion or packet batch can exceed its time limit.

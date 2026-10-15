@@ -1,0 +1,563 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 15 Oct 2026 10:07:13 +0800
+Subject: [PATCH] Bound login and chunk work during player join bursts
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/TickWorkBudget.java b/src/main/java/com/hpfxd/pandaspigot/TickWorkBudget.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..ae9e639c6567f84859ecff4a505795c598a6c79b
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/TickWorkBudget.java
+@@ -0,0 +1,28 @@
++package com.hpfxd.pandaspigot;
++
++public final class TickWorkBudget {
++    private int limit;
++    private int completed;
++    private long budgetNanos;
++    private long elapsedNanos;
++
++    public void reset(int limit, long budgetNanos) {
++        this.limit = limit;
++        this.budgetNanos = Math.max(1L, budgetNanos);
++        this.completed = 0;
++        this.elapsedNanos = 0;
++    }
++
++    public boolean hasRemaining() {
++        return this.completed < this.limit && this.elapsedNanos < this.budgetNanos;
++    }
++
++    public int remaining() {
++        return this.limit - this.completed;
++    }
++
++    public void record(int completed, long startedNanos) {
++        this.completed += completed;
++        this.elapsedNanos += System.nanoTime() - startedNanos;
++    }
++}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index f96b68d33266cdc73250bb89745b23a086b170d0..d07058e5068dadf30951b59544c8447bd0678f69 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -51,6 +51,13 @@ public class PandaSpigotConfig {
+                     || config.autoSaveMaxChunksPerTick <= 0) {
+                 throw new IllegalArgumentException("autoSaveMaxMillisPerTick and autoSaveMaxChunksPerTick must be positive");
+             }
++            // PandaSpigot start - Bound login and chunk work
++            if (config.maxLoginsPerTick <= 0 || !Double.isFinite(config.loginMaxMillisPerTick) || config.loginMaxMillisPerTick <= 0
++                    || config.chunkIoMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkIoMaxMillisPerTick) || config.chunkIoMaxMillisPerTick <= 0
++                    || config.chunkSendMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkSendMaxMillisPerTick) || config.chunkSendMaxMillisPerTick <= 0) {
++                throw new IllegalArgumentException("Login and chunk work count and time limits must be positive");
++            }
++            // PandaSpigot end
+             
+             // worlds
+             CommentedConfigurationNode worldsNode = root.node("worlds")
+@@ -138,4 +145,13 @@ public class PandaSpigotConfig {
+     public double autoSaveMaxMillisPerTick = 2.0;
+ 
+     public int autoSaveMaxChunksPerTick = 24;
++
++    // PandaSpigot start - Bound login and chunk work
++    public int maxLoginsPerTick = 4;
++    public double loginMaxMillisPerTick = 6.0;
++    public int chunkIoMaxChunksPerTick = 64;
++    public double chunkIoMaxMillisPerTick = 4.0;
++    public int chunkSendMaxChunksPerTick = 256;
++    public double chunkSendMaxMillisPerTick = 4.0;
++    // PandaSpigot end
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 6f804d5b1eaa085366b5213a98bc412cada1f078..6fa390a18d705d2ba600dd0935449739aff49a88 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -241,54 +241,7 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+             this.playerConnection.sendPacket(new PacketPlayOutEntityDestroy(aint));
+         }
+ 
+-        if (!this.chunkCoordIntPairQueue.isEmpty()) {
+-            ArrayList arraylist = Lists.newArrayList();
+-            Iterator iterator1 = this.chunkCoordIntPairQueue.iterator();
+-            ArrayList arraylist1 = Lists.newArrayList();
+-
+-            Chunk chunk;
+-
+-            while (iterator1.hasNext() && arraylist.size() < this.world.spigotConfig.maxBulkChunk) { // Spigot
+-                ChunkCoordIntPair chunkcoordintpair = (ChunkCoordIntPair) iterator1.next();
+-
+-                if (chunkcoordintpair != null) {
+-                    if (this.world.isLoaded(new BlockPosition(chunkcoordintpair.x << 4, 0, chunkcoordintpair.z << 4))) {
+-                        chunk = this.world.getChunkAt(chunkcoordintpair.x, chunkcoordintpair.z);
+-                        if (chunk.isReady()) {
+-                            arraylist.add(chunk);
+-                            arraylist1.addAll(chunk.tileEntities.values()); // CraftBukkit - Get tile entities directly from the chunk instead of the world
+-                            iterator1.remove();
+-                            new io.papermc.paper.event.packet.PlayerChunkLoadEvent(chunk.bukkitChunk, this.getBukkitEntity()).callEvent(); // PandaSpigot
+-                        }
+-                    }
+-                } else {
+-                    iterator1.remove();
+-                }
+-            }
+-
+-            if (!arraylist.isEmpty()) {
+-                if (arraylist.size() == 1) {
+-                    this.playerConnection.sendPacket(new PacketPlayOutMapChunk((Chunk) arraylist.get(0), true, '\uffff'));
+-                } else {
+-                    this.playerConnection.sendPacket(new PacketPlayOutMapChunkBulk(arraylist));
+-                }
+-
+-                Iterator iterator2 = arraylist1.iterator();
+-
+-                while (iterator2.hasNext()) {
+-                    TileEntity tileentity = (TileEntity) iterator2.next();
+-
+-                    this.a(tileentity);
+-                }
+-
+-                iterator2 = arraylist.iterator();
+-
+-                while (iterator2.hasNext()) {
+-                    chunk = (Chunk) iterator2.next();
+-                    this.u().getTracker().a(this, chunk);
+-                }
+-            }
+-        }
++        if (!this.chunkCoordIntPairQueue.isEmpty()) this.server.queuePlayerChunks(this); // PandaSpigot
+ 
+         Entity entity = this.C();
+ 
+@@ -306,6 +259,58 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+ 
+     }
+ 
++    // PandaSpigot start - Preserve chunk events, packets, tile entities and tracker order
++    int sendQueuedChunks(int maxChunks) {
++        ArrayList arraylist = Lists.newArrayList();
++        Iterator iterator1 = this.chunkCoordIntPairQueue.iterator();
++        ArrayList arraylist1 = Lists.newArrayList();
++
++        Chunk chunk;
++
++        while (iterator1.hasNext() && arraylist.size() < Math.min(maxChunks, this.world.spigotConfig.maxBulkChunk)) { // Spigot
++            ChunkCoordIntPair chunkcoordintpair = (ChunkCoordIntPair) iterator1.next();
++
++            if (chunkcoordintpair != null) {
++                if (this.world.isLoaded(new BlockPosition(chunkcoordintpair.x << 4, 0, chunkcoordintpair.z << 4))) {
++                    chunk = this.world.getChunkAt(chunkcoordintpair.x, chunkcoordintpair.z);
++                    if (chunk.isReady()) {
++                        arraylist.add(chunk);
++                        arraylist1.addAll(chunk.tileEntities.values()); // CraftBukkit - Get tile entities directly from the chunk instead of the world
++                        iterator1.remove();
++                        new io.papermc.paper.event.packet.PlayerChunkLoadEvent(chunk.bukkitChunk, this.getBukkitEntity()).callEvent(); // PandaSpigot
++                    }
++                }
++            } else {
++                iterator1.remove();
++            }
++        }
++
++        if (!arraylist.isEmpty()) {
++            if (arraylist.size() == 1) {
++                this.playerConnection.sendPacket(new PacketPlayOutMapChunk((Chunk) arraylist.get(0), true, '\uffff'));
++            } else {
++                this.playerConnection.sendPacket(new PacketPlayOutMapChunkBulk(arraylist));
++            }
++
++            Iterator iterator2 = arraylist1.iterator();
++
++            while (iterator2.hasNext()) {
++                TileEntity tileentity = (TileEntity) iterator2.next();
++
++                this.a(tileentity);
++            }
++
++            iterator2 = arraylist.iterator();
++
++            while (iterator2.hasNext()) {
++                chunk = (Chunk) iterator2.next();
++                this.u().getTracker().a(this, chunk);
++            }
++        }
++        return arraylist.size();
++    }
++    // PandaSpigot end
++
+     public void l() {
+         try {
+             super.t_();
+diff --git a/src/main/java/net/minecraft/server/LoginListener.java b/src/main/java/net/minecraft/server/LoginListener.java
+index ddaa5c935b614d2fe1dfef410454ab3421019def..5784ffa19694fb8ac0ee481f10b5ec37728e99c4 100644
+--- a/src/main/java/net/minecraft/server/LoginListener.java
++++ b/src/main/java/net/minecraft/server/LoginListener.java
+@@ -57,14 +57,18 @@ public class LoginListener implements PacketLoginInListener, IUpdatePlayerListBo
+ 
+     public void c() {
+         if (this.g == LoginListener.EnumProtocolState.READY_TO_ACCEPT) {
+-            this.b();
++            this.server.aq().acceptPlayer(this::b); // PandaSpigot - Bound login acceptance
+         } else if (this.g == LoginListener.EnumProtocolState.e) {
+             EntityPlayer entityplayer = this.server.getPlayerList().a(this.i.getId());
+ 
+             if (entityplayer == null) {
+-                this.g = LoginListener.EnumProtocolState.READY_TO_ACCEPT;
+-                this.server.getPlayerList().a(this.networkManager, this.l);
+-                this.l = null;
++                // PandaSpigot start - Delayed reconnects share the login budget
++                this.server.aq().acceptPlayer(() -> {
++                    this.g = LoginListener.EnumProtocolState.READY_TO_ACCEPT;
++                    this.server.getPlayerList().a(this.networkManager, this.l);
++                    this.l = null;
++                });
++                // PandaSpigot end
+             }
+         }
+ 
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index 8b8c66940effb5c12eea8a8dd38169d9ff55631d..0db4d8725863dc832f5f2207ed378c5e7b7dac4c 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -62,6 +62,7 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+     protected final ICommandHandler b;
+     public final MethodProfiler methodProfiler = new MethodProfiler();
+     private ServerConnection q; // Spigot
++    private final PlayerChunkSendQueue chunkSendQueue = new PlayerChunkSendQueue(); // PandaSpigot
+     private final ServerPing r = new ServerPing();
+     private final Random s = new Random();
+     private String serverIp;
+@@ -1034,6 +1035,7 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         }
+ 
+         this.methodProfiler.c("connection");
++        this.chunkSendQueue.tick(this); // PandaSpigot - Share chunk sending across players and worlds
+         SpigotTimings.connectionTimer.startTiming(); // Spigot
+         this.aq().c();
+         SpigotTimings.connectionTimer.stopTiming(); // Spigot
+@@ -1595,6 +1597,10 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+         return this.q == null ? this.q = new ServerConnection(this) : this.q; // Spigot
+     }
+ 
++    public void queuePlayerChunks(EntityPlayer player) {
++        this.chunkSendQueue.add(player); // PandaSpigot
++    }
++
+     public boolean as() {
+         return false;
+     }
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..38833121dff495fcab626b273f94a08ecaec35fa
+--- /dev/null
++++ b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+@@ -0,0 +1,39 @@
++package net.minecraft.server;
++
++import com.hpfxd.pandaspigot.TickWorkBudget;
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
++
++import java.util.Iterator;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.UUID;
++
++public final class PlayerChunkSendQueue {
++    private final Map<UUID, EntityPlayer> pending = new LinkedHashMap<>();
++    private final TickWorkBudget budget = new TickWorkBudget();
++
++    public void add(EntityPlayer player) {
++        this.pending.put(player.getUniqueID(), player);
++    }
++
++    public void tick(MinecraftServer server) {
++        PandaSpigotConfig config = PandaSpigotConfig.get();
++        this.budget.reset(config.chunkSendMaxChunksPerTick, (long) (config.chunkSendMaxMillisPerTick * 1_000_000L));
++        int turns = this.pending.size();
++        while (turns-- > 0 && this.budget.hasRemaining()) {
++            Iterator<EntityPlayer> iterator = this.pending.values().iterator();
++            EntityPlayer player = iterator.next();
++            iterator.remove();
++            if (server.getPlayerList().a(player.getUniqueID()) != player || player.playerConnection == null
++                || !player.playerConnection.networkManager.g() || player.chunkCoordIntPairQueue.isEmpty()) continue;
++            long started = System.nanoTime();
++            int sent = 0;
++            try {
++                sent = player.sendQueuedChunks(this.budget.remaining());
++            } finally {
++                this.budget.record(sent, started);
++            }
++            if (!player.chunkCoordIntPairQueue.isEmpty()) this.pending.put(player.getUniqueID(), player);
++        }
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/ServerConnection.java b/src/main/java/net/minecraft/server/ServerConnection.java
+index 882bf62cc8a08e51b5d315c608194a68ae025489..7c4dbe9ffdffbb02b9b3b51ba4ed18307a9938fc 100644
+--- a/src/main/java/net/minecraft/server/ServerConnection.java
++++ b/src/main/java/net/minecraft/server/ServerConnection.java
+@@ -2,6 +2,8 @@ package net.minecraft.server;
+ 
+ import com.google.common.collect.Lists;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
++import com.hpfxd.pandaspigot.TickWorkBudget;
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
+ import io.netty.bootstrap.ServerBootstrap;
+ import io.netty.channel.Channel;
+ import io.netty.channel.ChannelException;
+@@ -58,6 +60,7 @@ public class ServerConnection {
+         }
+     };
+     private final MinecraftServer f;
++    private final TickWorkBudget loginBudget = new TickWorkBudget(); // PandaSpigot
+     public volatile boolean d;
+     private final List<ChannelFuture> g = Collections.synchronizedList(Lists.<ChannelFuture>newArrayList());
+     private final List<NetworkManager> h = Collections.synchronizedList(Lists.<NetworkManager>newArrayList());
+@@ -154,6 +157,10 @@ public class ServerConnection {
+     }
+ 
+     public void c() {
++        // PandaSpigot start - Spread login acceptance across ticks
++        PandaSpigotConfig config = PandaSpigotConfig.get();
++        this.loginBudget.reset(config.maxLoginsPerTick, (long) (config.loginMaxMillisPerTick * 1_000_000L));
++        // PandaSpigot end
+         List list = this.h;
+ 
+         synchronized (this.h) {
+@@ -218,4 +225,16 @@ public class ServerConnection {
+     public MinecraftServer d() {
+         return this.f;
+     }
++
++    // PandaSpigot start - Keep login events and acceptance on the main thread
++    public void acceptPlayer(Runnable acceptance) {
++        if (!this.loginBudget.hasRemaining()) return;
++        long started = System.nanoTime();
++        try {
++            acceptance.run();
++        } finally {
++            this.loginBudget.record(1, started);
++        }
++    }
++    // PandaSpigot end
+ }
+diff --git a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+index 69e5da4c65da46ad9d1456266cd4ad15b136f6e4..f432702e73435614012440298f80f3bbe317d21b 100644
+--- a/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
++++ b/src/main/java/org/bukkit/craftbukkit/chunkio/ChunkIOExecutor.java
+@@ -1,5 +1,8 @@
+ package org.bukkit.craftbukkit.chunkio;
+ 
++import com.hpfxd.pandaspigot.TickWorkBudget;
++import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
++
+ import net.minecraft.server.Chunk;
+ import net.minecraft.server.ChunkProviderServer;
+ import net.minecraft.server.ChunkRegionLoader;
+@@ -11,6 +14,7 @@ public class ChunkIOExecutor {
+     static final int PLAYERS_PER_THREAD = 50;
+ 
+     private static final AsynchronousExecutor<QueuedChunk, Chunk, Runnable, RuntimeException> instance = new AsynchronousExecutor<QueuedChunk, Chunk, Runnable, RuntimeException>(new ChunkIOProvider(), BASE_THREADS);
++    private static final TickWorkBudget completionBudget = new TickWorkBudget(); // PandaSpigot
+ 
+     public static Chunk syncChunkLoad(World world, ChunkRegionLoader loader, ChunkProviderServer provider, int x, int z) {
+         return instance.getSkipQueue(new QueuedChunk(x, z, loader, world, provider));
+@@ -31,6 +35,10 @@ public class ChunkIOExecutor {
+     }
+ 
+     public static void tick() {
+-        instance.finishActive();
++        // PandaSpigot start - Share completion limits across worlds
++        PandaSpigotConfig config = PandaSpigotConfig.get();
++        completionBudget.reset(config.chunkIoMaxChunksPerTick, (long) (config.chunkIoMaxMillisPerTick * 1_000_000L));
++        instance.finishActive(completionBudget);
++        // PandaSpigot end
+     }
+ }
+diff --git a/src/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java b/src/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
+index 193c3621c6398aa7e67719a19c082668ed7bad9c..f47dd1bbe34242e189d50905ac6963135e9cecff 100644
+--- a/src/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
++++ b/src/main/java/org/bukkit/craftbukkit/util/AsynchronousExecutor.java
+@@ -1,5 +1,7 @@
+ package org.bukkit.craftbukkit.util;
+ 
++import com.hpfxd.pandaspigot.TickWorkBudget;
++
+ import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
+@@ -348,6 +350,20 @@ public final class AsynchronousExecutor<P, T, C, E extends Throwable> {
+         }
+     }
+ 
++    // PandaSpigot start - Budget only asynchronous completion, keeping synchronous gets immediate
++    public void finishActive(TickWorkBudget budget) throws E {
++        Task task;
++        while (budget.hasRemaining() && (task = this.finished.poll()) != null) {
++            long started = System.nanoTime();
++            try {
++                task.finish();
++            } finally {
++                budget.record(1, started);
++            }
++        }
++    }
++    // PandaSpigot end
++
+     public void setActiveThreads(final int coreSize) {
+         pool.setCorePoolSize(coreSize);
+     }
+diff --git a/src/test/java/com/hpfxd/pandaspigot/TickWorkBudgetTest.java b/src/test/java/com/hpfxd/pandaspigot/TickWorkBudgetTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..faf938f6721f51c4d3950553fba592760a219e0a
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/TickWorkBudgetTest.java
+@@ -0,0 +1,22 @@
++package com.hpfxd.pandaspigot;
++
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class TickWorkBudgetTest {
++    @Test
++    public void sharesCountAndElapsedWorkAcrossCallsAndResetsForTheNextTick() {
++        TickWorkBudget budget = new TickWorkBudget();
++        budget.reset(2, Long.MAX_VALUE);
++        budget.record(1, System.nanoTime());
++        assertTrue(budget.hasRemaining());
++        assertEquals(1, budget.remaining());
++        budget.record(1, System.nanoTime());
++        assertFalse(budget.hasRemaining());
++        budget.reset(4, 0L);
++        assertTrue(budget.hasRemaining());
++        budget.record(1, System.nanoTime() - 1L);
++        assertFalse(budget.hasRemaining());
++    }
++}
+diff --git a/src/test/java/org/bukkit/craftbukkit/util/AsynchronousExecutorBudgetTest.java b/src/test/java/org/bukkit/craftbukkit/util/AsynchronousExecutorBudgetTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..d7bff924b4eb08e740f969f007a10920a599c312
+--- /dev/null
++++ b/src/test/java/org/bukkit/craftbukkit/util/AsynchronousExecutorBudgetTest.java
+@@ -0,0 +1,120 @@
++package org.bukkit.craftbukkit.util;
++
++import com.hpfxd.pandaspigot.TickWorkBudget;
++
++import java.util.ArrayList;
++import java.util.Arrays;
++import java.util.List;
++import java.util.concurrent.TimeUnit;
++
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class AsynchronousExecutorBudgetTest {
++    @Test
++    public void limitsCompletionsWithoutChangingImmediateGetsOrReplayingCallbacks() throws Exception {
++        List<Integer> completed = new ArrayList<>();
++        AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> executor = executor();
++        try {
++            executor.add(1, () -> completed.add(1));
++            executor.add(2, () -> completed.add(2));
++            executor.add(3, () -> completed.add(3));
++            awaitFinished(executor, 3);
++            TickWorkBudget budget = new TickWorkBudget();
++            budget.reset(1, Long.MAX_VALUE);
++            executor.finishActive(budget);
++            assertEquals(Arrays.asList(1), completed);
++            assertEquals(Integer.valueOf(3), executor.getSkipQueue(3));
++            assertEquals(Arrays.asList(1, 3), completed);
++            budget.reset(4, Long.MAX_VALUE);
++            executor.finishActive(budget);
++            assertEquals(Arrays.asList(1, 3, 2), completed);
++            assertTrue(executor.tasks.isEmpty());
++        } finally {
++            executor.pool.shutdownNow();
++        }
++    }
++
++    @Test
++    public void droppedCallbacksRemainDroppedWhileOtherCompletionsWaitForBudget() throws Exception {
++        List<Integer> completed = new ArrayList<>();
++        AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> executor = executor();
++        try {
++            Runnable dropped = () -> completed.add(1);
++            executor.add(1, dropped);
++            executor.add(2, () -> completed.add(2));
++            awaitFinished(executor, 2);
++            executor.drop(1, dropped);
++            TickWorkBudget budget = new TickWorkBudget();
++            budget.reset(4, 1L);
++            executor.finishActive(budget);
++            assertTrue(completed.isEmpty());
++            budget.reset(4, Long.MAX_VALUE);
++            executor.finishActive(budget);
++            assertEquals(Arrays.asList(2), completed);
++            assertTrue(executor.tasks.isEmpty());
++        } finally {
++            executor.pool.shutdownNow();
++        }
++    }
++
++    @Test
++    public void callbackFailureConsumesItsBudgetAndDoesNotReplayTheFailedTask() throws Exception {
++        List<Integer> completed = new ArrayList<>();
++        AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> executor = executor();
++        RuntimeException failure = new RuntimeException("callback");
++        try {
++            executor.add(1, () -> {
++                throw failure;
++            });
++            executor.add(2, () -> completed.add(2));
++            awaitFinished(executor, 2);
++            TickWorkBudget budget = new TickWorkBudget();
++            budget.reset(1, Long.MAX_VALUE);
++            try {
++                executor.finishActive(budget);
++                fail("Callback failure must propagate");
++            } catch (RuntimeException actual) {
++                assertSame(failure, actual);
++            }
++            assertFalse(budget.hasRemaining());
++            assertFalse(executor.tasks.containsKey(1));
++            budget.reset(1, Long.MAX_VALUE);
++            executor.finishActive(budget);
++            assertEquals(Arrays.asList(2), completed);
++            assertTrue(executor.tasks.isEmpty());
++        } finally {
++            executor.pool.shutdownNow();
++        }
++    }
++
++    private static AsynchronousExecutor<Integer, Integer, Runnable, RuntimeException> executor() {
++        return new AsynchronousExecutor<>(new AsynchronousExecutor.CallBackProvider<Integer, Integer, Runnable, RuntimeException>() {
++            @Override
++            public Integer callStage1(Integer parameter) {
++                return parameter;
++            }
++
++            @Override
++            public void callStage2(Integer parameter, Integer object) {
++            }
++
++            @Override
++            public void callStage3(Integer parameter, Integer object, Runnable callback) {
++                callback.run();
++            }
++
++            @Override
++            public Thread newThread(Runnable task) {
++                return new Thread(task);
++            }
++        }, 1);
++    }
++
++    private static void awaitFinished(AsynchronousExecutor<?, ?, ?, ?> executor, int count) throws InterruptedException {
++        long deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5);
++        while (executor.finished.size() < count && System.nanoTime() < deadline) Thread.sleep(1);
++        assertEquals(count, executor.finished.size());
++    }
++}

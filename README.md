@@ -37,6 +37,27 @@ loaded-chunk reference snapshot can exceed it. Player and world metadata saving
 keep their existing scheduling. Explicit saves, chunk/world unloads and shutdown
 keep the existing complete save and flush paths.
 
+### Login and chunk work
+
+`pandaspigot.yml` controls work shared by every player and world:
+
+```yaml
+maxLoginsPerTick: 4
+loginMaxMillisPerTick: 6.0
+chunkIoMaxChunksPerTick: 64
+chunkIoMaxMillisPerTick: 4.0
+chunkSendMaxChunksPerTick: 256
+chunkSendMaxMillisPerTick: 4.0
+```
+
+All limits must be positive. Login acceptance and delayed reconnects share the
+login budget. Completed asynchronous chunk loads retain their callbacks until
+their main-thread completion runs; synchronous chunk loads still complete
+immediately. Chunk packets rotate through players, preserve each world's
+`max-bulk-chunks` limit, and send tile entities and tracked entities after the
+chunk packet. Budgets are checked between operations; one login, chunk
+completion or packet batch can exceed its time limit.
+
 ## Using
 You can download the latest pre-built server JAR by clicking the download button below.  
 [![Download](https://custom-icon-badges.demolab.com/badge/-Download-blue?style=for-the-badge&logo=download&logoColor=white)](https://downloads.hpfxd.com/v2/projects/pandaspigot/versions/1.8.8/builds/latest/downloads/paperclip)

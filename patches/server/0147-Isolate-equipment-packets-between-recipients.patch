@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 17 Oct 2026 11:14:33 +0800
+Subject: [PATCH] Isolate equipment packets between recipients
+
+
+diff --git a/src/main/java/net/minecraft/server/EntityTrackerEntry.java b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+index 0b90b6f30ea09fb117281d5ddd2fc752d2c139b5..848e6435a5e539c2b701c5c2982d45d26b0a1ee3 100644
+--- a/src/main/java/net/minecraft/server/EntityTrackerEntry.java
++++ b/src/main/java/net/minecraft/server/EntityTrackerEntry.java
+@@ -301,7 +301,7 @@ public class EntityTrackerEntry {
+         while (iterator.hasNext()) {
+             EntityPlayer entityplayer = (EntityPlayer) iterator.next();
+ 
+-            entityplayer.playerConnection.sendPacket(packet);
++            entityplayer.playerConnection.sendPacket(packet instanceof PacketPlayOutEntityEquipment ? ((PacketPlayOutEntityEquipment) packet).copy() : packet); // PandaSpigot
+         }
+ 
+     }
+@@ -309,7 +309,7 @@ public class EntityTrackerEntry {
+     public void broadcastIncludingSelf(Packet packet) {
+         this.broadcast(packet);
+         if (this.tracker instanceof EntityPlayer) {
+-            ((EntityPlayer) this.tracker).playerConnection.sendPacket(packet);
++            ((EntityPlayer) this.tracker).playerConnection.sendPacket(packet instanceof PacketPlayOutEntityEquipment ? ((PacketPlayOutEntityEquipment) packet).copy() : packet); // PandaSpigot
+         }
+ 
+     }
+diff --git a/src/main/java/net/minecraft/server/PacketPlayOutEntityEquipment.java b/src/main/java/net/minecraft/server/PacketPlayOutEntityEquipment.java
+index aa8f893bc4c7930fbe85028fcf45dcd2866cd982..0fe8920b4cd8d28144bbbcfddee678bca6bff36c 100644
+--- a/src/main/java/net/minecraft/server/PacketPlayOutEntityEquipment.java
++++ b/src/main/java/net/minecraft/server/PacketPlayOutEntityEquipment.java
+@@ -16,6 +16,12 @@ public class PacketPlayOutEntityEquipment implements Packet<PacketListenerPlayOu
+         this.c = itemstack == null ? null : itemstack.cloneItemStack();
+     }
+ 
++    // PandaSpigot start
++    public PacketPlayOutEntityEquipment copy() {
++        return new PacketPlayOutEntityEquipment(this.a, this.b, this.c);
++    }
++    // PandaSpigot end
++
+     @Override
+     public void a(PacketDataSerializer packetdataserializer) throws IOException {
+         this.a = packetdataserializer.e();
+diff --git a/src/test/java/net/minecraft/server/EntityEquipmentPacketTest.java b/src/test/java/net/minecraft/server/EntityEquipmentPacketTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..6aa975cbe459377c3c1ed7c0062565d0e0c1bb84
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/EntityEquipmentPacketTest.java
+@@ -0,0 +1,35 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class EntityEquipmentPacketTest extends AbstractTestingBase {
++    @Test
++    public void recipientCopiesDoNotShareItemTags() throws Exception {
++        ItemStack helmet = new ItemStack(Items.IRON_HELMET);
++        NBTTagCompound nested = new NBTTagCompound();
++        nested.setByteArray("bytes", new byte[]{1, 2});
++        NBTTagCompound tags = new NBTTagCompound();
++        tags.set("nested", nested);
++        helmet.setTag(tags);
++        PacketPlayOutEntityEquipment original = new PacketPlayOutEntityEquipment(42, 4, helmet);
++        PacketPlayOutEntityEquipment first = original.copy();
++        PacketPlayOutEntityEquipment second = original.copy();
++        Field item = PacketPlayOutEntityEquipment.class.getDeclaredField("c");
++        item.setAccessible(true);
++        ((ItemStack) item.get(first)).getTag().getCompound("nested").getByteArray("bytes")[0] = 9;
++        item.set(first, null);
++        assertEquals(1, ((ItemStack) item.get(second)).getTag().getCompound("nested").getByteArray("bytes")[0]);
++        assertEquals(1, ((ItemStack) item.get(original)).getTag().getCompound("nested").getByteArray("bytes")[0]);
++        assertEquals(1, helmet.getTag().getCompound("nested").getByteArray("bytes")[0]);
++        for (String name : new String[]{"a", "b"}) {
++            Field field = PacketPlayOutEntityEquipment.class.getDeclaredField(name);
++            field.setAccessible(true);
++            assertEquals(field.get(original), field.get(second));
++        }
++        assertNull(item.get(new PacketPlayOutEntityEquipment(42, 4, null).copy()));
++    }
++}

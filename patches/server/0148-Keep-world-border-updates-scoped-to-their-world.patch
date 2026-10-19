@@ -1,0 +1,113 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sun, 18 Oct 2026 20:05:11 +0800
+Subject: [PATCH] Keep world border updates scoped to their world
+
+
+diff --git a/src/main/java/net/minecraft/server/PlayerList.java b/src/main/java/net/minecraft/server/PlayerList.java
+index 412b354d1f57491bcb4f125e8d59e395bfe75da0..b5b544cfb2de7c89e60430b6fc779abcd1467614 100644
+--- a/src/main/java/net/minecraft/server/PlayerList.java
++++ b/src/main/java/net/minecraft/server/PlayerList.java
+@@ -237,31 +237,6 @@ public abstract class PlayerList {
+     public void setPlayerFileData(WorldServer[] aworldserver) {
+         if (playerFileData != null) return; // CraftBukkit
+         this.playerFileData = aworldserver[0].getDataManager().getPlayerFileData();
+-        aworldserver[0].getWorldBorder().a(new IWorldBorderListener() {
+-            public void a(WorldBorder worldborder, double d0) {
+-                PlayerList.this.sendAll(new PacketPlayOutWorldBorder(worldborder, PacketPlayOutWorldBorder.EnumWorldBorderAction.SET_SIZE));
+-            }
+-
+-            public void a(WorldBorder worldborder, double d0, double d1, long i) {
+-                PlayerList.this.sendAll(new PacketPlayOutWorldBorder(worldborder, PacketPlayOutWorldBorder.EnumWorldBorderAction.LERP_SIZE));
+-            }
+-
+-            public void a(WorldBorder worldborder, double d0, double d1) {
+-                PlayerList.this.sendAll(new PacketPlayOutWorldBorder(worldborder, PacketPlayOutWorldBorder.EnumWorldBorderAction.SET_CENTER));
+-            }
+-
+-            public void a(WorldBorder worldborder, int i) {
+-                PlayerList.this.sendAll(new PacketPlayOutWorldBorder(worldborder, PacketPlayOutWorldBorder.EnumWorldBorderAction.SET_WARNING_TIME));
+-            }
+-
+-            public void b(WorldBorder worldborder, int i) {
+-                PlayerList.this.sendAll(new PacketPlayOutWorldBorder(worldborder, PacketPlayOutWorldBorder.EnumWorldBorderAction.SET_WARNING_BLOCKS));
+-            }
+-
+-            public void b(WorldBorder worldborder, double d0) {}
+-
+-            public void c(WorldBorder worldborder, double d0) {}
+-        });
+     }
+ 
+     public void a(EntityPlayer entityplayer, WorldServer worldserver) {
+diff --git a/src/test/java/net/minecraft/server/WorldBorderBroadcastTest.java b/src/test/java/net/minecraft/server/WorldBorderBroadcastTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..b48bda2e9a6ae1cd93450d2a9756dff7bf13c39f
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/WorldBorderBroadcastTest.java
+@@ -0,0 +1,65 @@
++package net.minecraft.server;
++
++import java.lang.reflect.Field;
++import java.lang.reflect.Proxy;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.assertEquals;
++import static org.junit.Assert.assertSame;
++
++public class WorldBorderBroadcastTest extends AbstractTestingBase {
++    @Test
++    public void mainWorldBorderChangesDoNotBroadcastToOtherWorlds() throws Exception {
++        IPlayerFileData storage = (IPlayerFileData) Proxy.newProxyInstance(
++                IPlayerFileData.class.getClassLoader(), new Class<?>[]{IPlayerFileData.class},
++                (proxy, method, args) -> { throw new AssertionError(method); });
++        IDataManager dataManager = (IDataManager) Proxy.newProxyInstance(
++                IDataManager.class.getClassLoader(), new Class<?>[]{IDataManager.class},
++                (proxy, method, args) -> {
++                    if (method.getName().equals("getPlayerFileData")) return storage;
++                    throw new AssertionError(method);
++                });
++        WorldBorder border = new WorldBorder();
++        WorldServer mainWorld = allocate(WorldServer.class);
++        setWorldField(mainWorld, "dataManager", dataManager);
++        setWorldField(mainWorld, "N", border);
++        RecordingPlayerList players = allocate(RecordingPlayerList.class);
++
++        players.setPlayerFileData(new WorldServer[]{mainWorld});
++        border.setSize(512.0D);
++        border.transitionSizeBetween(512.0D, 256.0D, 1_000L);
++        border.setCenter(10.0D, 20.0D);
++        border.setWarningTime(10);
++        border.setWarningDistance(2);
++
++        assertSame(storage, players.playerFileData);
++        assertEquals(0, players.globalPacketCount);
++    }
++
++    private static void setWorldField(World world, String name, Object value) throws Exception {
++        Field field = World.class.getDeclaredField(name);
++        field.setAccessible(true);
++        field.set(world, value);
++    }
++
++    private static <T> T allocate(Class<T> type) throws Exception {
++        Class<?> unsafe = Class.forName("sun.misc.Unsafe");
++        Field field = unsafe.getDeclaredField("theUnsafe");
++        field.setAccessible(true);
++        return type.cast(unsafe.getMethod("allocateInstance", Class.class).invoke(field.get(null), type));
++    }
++
++    private static final class RecordingPlayerList extends PlayerList {
++        private int globalPacketCount;
++
++        private RecordingPlayerList() {
++            super(null);
++        }
++
++        @Override
++        public void sendAll(Packet packet) {
++            this.globalPacketCount++;
++        }
++    }
++}

@@ -1,0 +1,65 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 15 Oct 2026 16:30:00 +0800
+Subject: [PATCH] Require configured plugins before accepting connections
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index 4487c0c12c8e92902f28e4606e447d1f31cde50f..337692c6fbca7dd8f424688e649fc05858ef50bb 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -15,6 +15,8 @@ import org.spongepowered.configurate.util.NamingSchemes;
+ 
+ import java.io.File;
+ import java.util.HashMap;
++import java.util.ArrayList;
++import java.util.List;
+ import java.util.Map;
+ 
+ @ConfigSerializable
+@@ -119,6 +121,8 @@ public class PandaSpigotConfig {
+         "match your proxy's online-mode setting.")
+     public boolean proxyOnlineMode = true;
+ 
++    public List<String> requiredPlugins = new ArrayList<>();
++
+     public boolean isProxyOnlineMode() {
+         return Bukkit.getOnlineMode() || (SpigotConfig.bungee && this.proxyOnlineMode);
+     }
+diff --git a/src/main/java/net/minecraft/server/DedicatedServer.java b/src/main/java/net/minecraft/server/DedicatedServer.java
+index 0f4e8c767632430a4cda8905331e6cede4351566..d98a5ee2dd75f768cfa7ebc751302ecdcae79ff3 100644
+--- a/src/main/java/net/minecraft/server/DedicatedServer.java
++++ b/src/main/java/net/minecraft/server/DedicatedServer.java
+@@ -220,7 +220,9 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+             this.a(MinecraftEncryption.b());
+             DedicatedServer.LOGGER.info("Starting Minecraft server on " + (this.getServerIp().length() == 0 ? "*" : this.getServerIp()) + ":" + this.R());
+ 
+-        if (!org.spigotmc.SpigotConfig.lateBind) {
++        boolean lateBind = org.spigotmc.SpigotConfig.lateBind
++                || !com.hpfxd.pandaspigot.config.PandaSpigotConfig.get().requiredPlugins.isEmpty();
++        if (!lateBind) {
+             try {
+                 this.aq().bind(bindAddress); // PandaSpigot - Unix domain socket support
+             } catch (IOException ioexception) {
+@@ -299,6 +301,12 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+                 this.propertyManager.setProperty("max-build-height", Integer.valueOf(this.getMaxBuildHeight()));
+                 DedicatedServer.LOGGER.info("Preparing level \"" + this.U() + "\"");
+                 this.a(this.U(), this.U(), k, worldtype, s2);
++                for (String requiredPlugin : com.hpfxd.pandaspigot.config.PandaSpigotConfig.get().requiredPlugins) {
++                    if (!server.getPluginManager().isPluginEnabled(requiredPlugin)) {
++                        DedicatedServer.LOGGER.error("Required plugin is not enabled: {}", requiredPlugin);
++                        return false;
++                    }
++                }
+                 long i1 = System.nanoTime() - j;
+                 String s3 = String.format("%.3fs", new Object[] { Double.valueOf((double) i1 / 1.0E9D)});
+ 
+@@ -326,7 +334,7 @@ public class DedicatedServer extends MinecraftServer implements IMinecraftServer
+                 }
+                 // CraftBukkit end
+ 
+-        if (org.spigotmc.SpigotConfig.lateBind) {
++        if (lateBind) {
+             try {
+                 this.aq().bind(bindAddress); // PandaSpigot - Unix domain socket support
+             } catch (IOException ioexception) {

@@ -1,0 +1,1072 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Wed, 21 Oct 2026 16:08:46 +0800
+Subject: [PATCH] Add opt-in combat diagnostics
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/diagnostics/CombatTrace.java b/src/main/java/com/hpfxd/pandaspigot/diagnostics/CombatTrace.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..4134e2e4c64640d9df1558db088f9e6c9a9adc52
+--- /dev/null
++++ b/src/main/java/com/hpfxd/pandaspigot/diagnostics/CombatTrace.java
+@@ -0,0 +1,227 @@
++package com.hpfxd.pandaspigot.diagnostics;
++
++import java.util.Collections;
++import java.util.HashSet;
++import java.util.LinkedHashMap;
++import java.util.Map;
++import java.util.Set;
++import java.util.UUID;
++import java.util.function.Consumer;
++import java.util.function.ToLongFunction;
++import java.util.logging.Level;
++import java.util.logging.Logger;
++
++import net.minecraft.server.DamageSource;
++import net.minecraft.server.Entity;
++import net.minecraft.server.EntityHuman;
++import net.minecraft.server.EntityLiving;
++import net.minecraft.server.EntityPlayer;
++import net.minecraft.server.MinecraftServer;
++import net.minecraft.server.Packet;
++import net.minecraft.server.PacketListener;
++import net.minecraft.server.PacketPlayInUseEntity;
++import net.minecraft.server.PlayerConnection;
++
++public final class CombatTrace {
++    private static final Logger LOGGER = Logger.getLogger("PandaSpigot.CombatTrace");
++    private static final ThreadLocal<Long> PACKET = new ThreadLocal<>();
++    private static final ThreadLocal<Long> DAMAGE = new ThreadLocal<>();
++    private static final Scope DISABLED = new Scope(null, null);
++    private static volatile Capture capture;
++
++    private CombatTrace() {
++    }
++
++    public static synchronized void install(Set<UUID> players, Consumer<Map<String, Object>> sink, ToLongFunction<Object> ids) {
++        if (capture != null) throw new IllegalStateException("A core combat diagnostic sink is already installed");
++        if (players.isEmpty() || sink == null || ids == null)
++            throw new IllegalArgumentException("Invalid core diagnostic capture");
++        capture = new Capture(Collections.unmodifiableSet(new HashSet<>(players)), sink, ids);
++    }
++
++    public static synchronized void uninstall(Consumer<Map<String, Object>> sink) {
++        Capture current = capture;
++        if (current != null && current.sink == sink) capture = null;
++    }
++
++    public static long currentPacketId() {
++        Long id = PACKET.get();
++        return id == null ? 0 : id;
++    }
++
++    public static Scope packet(EntityPlayer player, PacketPlayInUseEntity packet, Entity target) {
++        Capture current = capture;
++        if (current == null || packet.a() != PacketPlayInUseEntity.EnumEntityUseAction.ATTACK
++                || !selected(current, player, target)) return DISABLED;
++        Long previous = PACKET.get();
++        try {
++            PACKET.set(current.ids.applyAsLong(packet));
++            log(player, target, "connection.attack.enter", "action", packet.a().name());
++            return new Scope(PACKET, previous);
++        } catch (RuntimeException | LinkageError failure) {
++            fail(current, failure);
++            if (previous == null) PACKET.remove();
++            else PACKET.set(previous);
++            return DISABLED;
++        }
++    }
++
++    public static long currentDamageId() {
++        Long id = DAMAGE.get();
++        return id == null ? 0 : id;
++    }
++
++    public static Scope damage(EntityLiving target, DamageSource source, float raw, Class<?> layer) {
++        Capture current = capture;
++        if (current == null || layer == EntityLiving.class && target instanceof EntityHuman
++                || layer == EntityHuman.class && target instanceof EntityPlayer
++                || !selected(current, source.getEntity(), target)) return DISABLED;
++        Long previous = DAMAGE.get();
++        try {
++            DAMAGE.set(current.ids.applyAsLong(new Object()));
++            log(source.getEntity(), target, "damage.call.enter", "raw", raw,
++                    "parentDamageId", previous == null ? 0L : previous, "directSource", state(source.i()));
++            return new Scope(DAMAGE, previous);
++        } catch (RuntimeException | LinkageError failure) {
++            fail(current, failure);
++            if (previous == null) DAMAGE.remove();
++            else DAMAGE.set(previous);
++            return DISABLED;
++        }
++    }
++
++    public static void network(PacketListener listener, Packet packet, String reason) {
++        Capture current = capture;
++        if (current == null || !(listener instanceof PlayerConnection) || !(packet instanceof PacketPlayInUseEntity))
++            return;
++        EntityPlayer player = ((PlayerConnection) listener).player;
++        if (!current.players.contains(player.getUniqueID())) return;
++        try {
++            Map<String, Object> fields = new LinkedHashMap<>();
++            fields.put("stage", "network.reject");
++            fields.put("packetId", current.ids.applyAsLong(packet));
++            fields.put("player", player.getUniqueID().toString());
++            fields.put("reason", reason);
++            current.sink.accept(fields);
++        } catch (RuntimeException | LinkageError failure) {
++            fail(current, failure);
++        }
++    }
++
++    public static void log(Entity source, Entity target, String stage, Object... values) {
++        Capture current = capture;
++        if (current == null || !selected(current, source, target)) return;
++        try {
++            Map<String, Object> fields = new LinkedHashMap<>();
++            fields.put("stage", stage);
++            fields.put("tick", MinecraftServer.currentTick);
++            fields.put("packetId", currentPacketId());
++            fields.put("damageId", currentDamageId());
++            fields.put("source", state(source));
++            fields.put("target", state(target));
++            for (int i = 0; i < values.length; i += 2) fields.put((String) values[i], values[i + 1]);
++            current.sink.accept(fields);
++        } catch (RuntimeException | LinkageError failure) {
++            fail(current, failure);
++        }
++    }
++
++    public static boolean damageResult(EntityLiving target, DamageSource source, float amount, boolean accepted, String reason) {
++        if (capture != null)
++            log(source.getEntity(), target, "damage.result", "raw", amount, "accepted", accepted, "reason", reason);
++        return accepted;
++    }
++
++    public static void write(EntityLiving target, String field, Object previous, Object value, String reason) {
++        Capture current = capture;
++        if (current == null || !current.players.contains(target.getUniqueID())) return;
++        StringBuilder callers = new StringBuilder();
++        StackTraceElement[] stack = Thread.currentThread().getStackTrace();
++        for (int i = 2; i < Math.min(stack.length, 14); i++) callers.append(stack[i]).append('\n');
++        log(null, target, "state.write", "field", field, "before", previous, "after", value, "reason", reason, "callers", callers.toString());
++    }
++
++    public static boolean enabled() {
++        return capture != null;
++    }
++
++    private static boolean selected(Capture current, Entity source, Entity target) {
++        return source != null && current.players.contains(source.getUniqueID())
++                || target != null && current.players.contains(target.getUniqueID());
++    }
++
++    private static Map<String, Object> state(Entity entity) {
++        if (entity == null) return null;
++        Map<String, Object> state = new LinkedHashMap<>();
++        state.put("uuid", entity.getUniqueID().toString());
++        state.put("entityId", entity.getId());
++        state.put("x", entity.locX);
++        state.put("y", entity.locY);
++        state.put("z", entity.locZ);
++        state.put("motionX", entity.motX);
++        state.put("motionY", entity.motY);
++        state.put("motionZ", entity.motZ);
++        state.put("sprint", entity.isSprinting());
++        state.put("dead", entity.dead);
++        state.put("onGround", entity.onGround);
++        state.put("fallDistance", entity.fallDistance);
++        state.put("yaw", entity.yaw);
++        state.put("pitch", entity.pitch);
++        if (entity instanceof EntityLiving) {
++            EntityLiving living = (EntityLiving) entity;
++            state.put("noDamageTicks", living.noDamageTicks);
++            state.put("maximumNoDamageTicks", living.maxNoDamageTicks);
++            state.put("lastDamage", living.lastDamage);
++            state.put("health", living.getHealth());
++            state.put("absorption", living.getAbsorptionHearts());
++        }
++        return state;
++    }
++
++    private static synchronized void fail(Capture current, Throwable failure) {
++        if (capture == current) capture = null;
++        LOGGER.log(Level.SEVERE, "Core combat diagnostics disabled after capture failure", failure);
++    }
++
++    public static final class Scope implements AutoCloseable {
++        private final ThreadLocal<Long> context;
++        private final Long previous;
++
++        private Scope(ThreadLocal<Long> context, Long previous) {
++            this.context = context;
++            this.previous = previous;
++        }
++
++        @Override
++        public void close() {
++            if (this.context == null) return;
++            Capture current = capture;
++            if (current != null) {
++                try {
++                    Map<String, Object> fields = new LinkedHashMap<>();
++                    fields.put("stage", this.context == DAMAGE ? "damage.call.exit" : "connection.attack.exit");
++                    fields.put("packetId", currentPacketId());
++                    fields.put("damageId", currentDamageId());
++                    fields.put("tick", MinecraftServer.currentTick);
++                    current.sink.accept(fields);
++                } catch (RuntimeException | LinkageError failure) {
++                    fail(current, failure);
++                }
++            }
++            if (this.previous == null) this.context.remove();
++            else this.context.set(this.previous);
++        }
++    }
++
++    private static final class Capture {
++        final Set<UUID> players;
++        final Consumer<Map<String, Object>> sink;
++        final ToLongFunction<Object> ids;
++
++        Capture(Set<UUID> players, Consumer<Map<String, Object>> sink, ToLongFunction<Object> ids) {
++            this.players = players;
++            this.sink = sink;
++            this.ids = ids;
++        }
++    }
++}
+diff --git a/src/main/java/net/minecraft/server/EntityHuman.java b/src/main/java/net/minecraft/server/EntityHuman.java
+index 524ff60ada7392ec1fd803661f957c19c50b2c2e..53f558dbb5cced5a50eee846044d54dc86059671 100644
+--- a/src/main/java/net/minecraft/server/EntityHuman.java
++++ b/src/main/java/net/minecraft/server/EntityHuman.java
+@@ -1,5 +1,7 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import com.google.common.base.Charsets;
+ import com.google.common.collect.Lists;
+ import com.mojang.authlib.GameProfile;
+@@ -762,45 +764,48 @@ public abstract class EntityHuman extends EntityLiving {
+     }
+ 
+     public boolean damageEntity(DamageSource damagesource, float f) {
+-        if (this.isInvulnerable(damagesource)) {
+-            return false;
+-        } else if (this.abilities.isInvulnerable && !damagesource.ignoresInvulnerability()) {
+-            return false;
+-        } else {
+-            this.ticksFarFromPlayer = 0;
+-            if (this.getHealth() <= 0.0F) {
+-                return false;
++        try (CombatTrace.Scope trace = CombatTrace.damage(this, damagesource, f, EntityHuman.class)) {
++            if (this.isInvulnerable(damagesource)) {
++                return CombatTrace.damageResult(this, damagesource, f, false, "human.invulnerable");
++            } else if (this.abilities.isInvulnerable && !damagesource.ignoresInvulnerability()) {
++                return CombatTrace.damageResult(this, damagesource, f, false, "human.ability_invulnerable");
+             } else {
+-                if (this.isSleeping() && !this.world.isClientSide) {
+-                    this.a(true, true, false);
+-                }
+-
+-                if (damagesource.r()) {
+-                    if (this.world.getDifficulty() == EnumDifficulty.PEACEFUL) {
+-                        return false; // CraftBukkit - f = 0.0f -> return false
++                this.ticksFarFromPlayer = 0;
++                if (this.getHealth() <= 0.0F) {
++                    return CombatTrace.damageResult(this, damagesource, f, false, "human.dead");
++                } else {
++                    if (this.isSleeping() && !this.world.isClientSide) {
++                        this.a(true, true, false);
+                     }
+ 
+-                    if (this.world.getDifficulty() == EnumDifficulty.EASY) {
+-                        f = f / 2.0F + 1.0F;
+-                    }
++                    if (damagesource.r()) {
++                        if (this.world.getDifficulty() == EnumDifficulty.PEACEFUL) {
++                            return CombatTrace.damageResult(this, damagesource, f, false, "human.peaceful"); // CraftBukkit - f = 0.0f -> return false
++                        }
+ 
+-                    if (this.world.getDifficulty() == EnumDifficulty.HARD) {
+-                        f = f * 3.0F / 2.0F;
++                        if (this.world.getDifficulty() == EnumDifficulty.EASY) {
++                            f = f / 2.0F + 1.0F;
++                        }
++
++                        if (this.world.getDifficulty() == EnumDifficulty.HARD) {
++                            f = f * 3.0F / 2.0F;
++                        }
+                     }
+-                }
+ 
+-                if (false && f == 0.0F) { // CraftBukkit - Don't filter out 0 damage
+-                    return false;
+-                } else {
+-                    Entity entity = damagesource.getEntity();
++                    if (false && f == 0.0F) { // CraftBukkit - Don't filter out 0 damage
++                        return false;
++                    } else {
++                        Entity entity = damagesource.getEntity();
+ 
+-                    if (entity instanceof EntityArrow && ((EntityArrow) entity).shooter != null) {
+-                        entity = ((EntityArrow) entity).shooter;
+-                    }
++                        if (entity instanceof EntityArrow && ((EntityArrow) entity).shooter != null) {
++                            entity = ((EntityArrow) entity).shooter;
++                        }
+ 
+-                    return super.damageEntity(damagesource, f);
++                        return super.damageEntity(damagesource, f);
++                    }
+                 }
+             }
++
+         }
+     }
+ 
+@@ -955,6 +960,7 @@ public abstract class EntityHuman extends EntityLiving {
+     }
+ 
+     public void attack(Entity entity) {
++        if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.enter");
+         // PandaSpigot start - PrePlayerAttackEntityEvent
+         boolean willAttack = entity.aD() && !entity.l(this); // Vanilla logic
+         io.papermc.paper.event.player.PrePlayerAttackEntityEvent playerAttackEntityEvent = new io.papermc.paper.event.player.PrePlayerAttackEntityEvent(
+@@ -962,7 +968,9 @@ public abstract class EntityHuman extends EntityLiving {
+             entity.getBukkitEntity(),
+             willAttack
+         );
+-        if (playerAttackEntityEvent.callEvent() && willAttack) { // Logic moved to willAttack local variable.
++        boolean attackAllowed = playerAttackEntityEvent.callEvent();
++        if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.pre_event", "willAttack", willAttack, "allowed", attackAllowed);
++        if (attackAllowed && willAttack) { // Logic moved to willAttack local variable.
+             {
+         // PandaSpigot end
+                 float f = (float) this.getAttributeInstance(GenericAttributes.ATTACK_DAMAGE).getValue();
+@@ -981,6 +989,7 @@ public abstract class EntityHuman extends EntityLiving {
+                     ++i;
+                 }
+ 
++                if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.attribute", "attribute", f, "enchantment", f1, "knockbackLevel", i);
+                 if (f > 0.0F || f1 > 0.0F) {
+                     boolean flag = !world.paperSpigotConfig.disablePlayerCrits && this.fallDistance > 0.0F && !this.onGround && !this.k_() && !this.V() && !this.hasEffect(MobEffectList.BLINDNESS) && this.vehicle == null && entity instanceof EntityLiving; // PaperSpigot
+ 
+@@ -1007,7 +1016,9 @@ public abstract class EntityHuman extends EntityLiving {
+                     double d0 = entity.motX;
+                     double d1 = entity.motY;
+                     double d2 = entity.motZ;
++                    if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.raw", "raw", f, "critical", flag, "enchantment", f1, "knockbackLevel", i);
+                     boolean flag2 = entity.damageEntity(DamageSource.playerAttack(this), f);
++                    if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.damage_result", "accepted", flag2);
+ 
+                     if (flag2) {
+                         if (i > 0) {
+@@ -1021,6 +1032,7 @@ public abstract class EntityHuman extends EntityLiving {
+                             this.motX *= 0.6D;
+                             this.motZ *= 0.6D;
+                             this.setSprinting(false);
++                            if (CombatTrace.enabled()) CombatTrace.log(this, entity, "human.attack.sprint_consumed");
+                         }
+ 
+                         if (entity instanceof EntityPlayer && entity.velocityChanged) {
+diff --git a/src/main/java/net/minecraft/server/EntityLiving.java b/src/main/java/net/minecraft/server/EntityLiving.java
+index 32752dfad24bc7883b1ab52e29834f1aa6fa60c6..b8a98fddb57c8b870c635de2f3530a6d74d9822b 100644
+--- a/src/main/java/net/minecraft/server/EntityLiving.java
++++ b/src/main/java/net/minecraft/server/EntityLiving.java
+@@ -1,5 +1,7 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import com.google.common.base.Predicate;
+ import com.google.common.base.Predicates;
+ import com.google.common.collect.Maps;
+@@ -709,126 +711,135 @@ public abstract class EntityLiving extends Entity {
+     }
+ 
+     public boolean damageEntity(DamageSource damagesource, float f) {
+-        if (this.isInvulnerable(damagesource)) {
+-            return false;
+-        } else if (this.world.isClientSide) {
+-            return false;
+-        } else {
+-            this.ticksFarFromPlayer = 0;
+-            if (this.getHealth() <= 0.0F) {
+-                return false;
+-            } else if (damagesource.o() && this.hasEffect(MobEffectList.FIRE_RESISTANCE)) {
+-                return false;
++        try (CombatTrace.Scope trace = CombatTrace.damage(this, damagesource, f, EntityLiving.class)) {
++            if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.enter", "raw", f, "damageSource", damagesource.translationIndex);
++            if (this.isInvulnerable(damagesource)) {
++                return CombatTrace.damageResult(this, damagesource, f, false, "living.invulnerable");
++            } else if (this.world.isClientSide) {
++                return CombatTrace.damageResult(this, damagesource, f, false, "living.client_side");
+             } else {
+-                // CraftBukkit - Moved into d(DamageSource, float)
+-                if (false && (damagesource == DamageSource.ANVIL || damagesource == DamageSource.FALLING_BLOCK) && this.getEquipment(4) != null) {
+-                    this.getEquipment(4).damage((int) (f * 4.0F + this.random.nextFloat() * f * 2.0F), this);
+-                    f *= 0.75F;
+-                }
++                this.ticksFarFromPlayer = 0;
++                if (this.getHealth() <= 0.0F) {
++                    return CombatTrace.damageResult(this, damagesource, f, false, "living.dead");
++                } else if (damagesource.o() && this.hasEffect(MobEffectList.FIRE_RESISTANCE)) {
++                    return CombatTrace.damageResult(this, damagesource, f, false, "living.fire_resistance");
++                } else {
++                    // CraftBukkit - Moved into d(DamageSource, float)
++                    if (false && (damagesource == DamageSource.ANVIL || damagesource == DamageSource.FALLING_BLOCK) && this.getEquipment(4) != null) {
++                        this.getEquipment(4).damage((int) (f * 4.0F + this.random.nextFloat() * f * 2.0F), this);
++                        f *= 0.75F;
++                    }
+ 
+-                this.aB = 1.5F;
+-                boolean flag = true;
++                    this.aB = 1.5F;
++                    boolean flag = true;
+ 
+-                if ((float) this.noDamageTicks > (float) this.maxNoDamageTicks / 2.0F) {
+-                    if (f <= this.lastDamage) {
+-                        this.forceExplosionKnockback = true; // CraftBukkit - SPIGOT-949 - for vanilla consistency, cooldown does not prevent explosion knockback
+-                        return false;
+-                    }
++                    if ((float) this.noDamageTicks > (float) this.maxNoDamageTicks / 2.0F) {
++                        if (f <= this.lastDamage) {
++                            this.forceExplosionKnockback = true; // CraftBukkit - SPIGOT-949 - for vanilla consistency, cooldown does not prevent explosion knockback
++                            return CombatTrace.damageResult(this, damagesource, f, false, "living.frame_not_stronger");
++                        }
+ 
+-                    // CraftBukkit start
+-                    if (!this.d(damagesource, f - this.lastDamage)) {
+-                        return false;
++                        if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.difference.attempt", "raw", f, "previousRaw", this.lastDamage, "difference", f - this.lastDamage);
++                        // CraftBukkit start
++                        if (!this.d(damagesource, f - this.lastDamage)) {
++                            return CombatTrace.damageResult(this, damagesource, f, false, "living.difference_rejected");
++                        }
++                        // CraftBukkit end
++                        this.lastDamage = f;
++                        flag = false;
++                        if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.difference.commit", "raw", f);
++                    } else {
++                        // CraftBukkit start
++                        float previousHealth = this.getHealth();
++                        if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.full.attempt", "raw", f);
++                        if (!this.d(damagesource, f)) {
++                            return CombatTrace.damageResult(this, damagesource, f, false, "living.full_rejected");
++                        }
++                        this.lastDamage = f;
++                        this.noDamageTicks = this.maxNoDamageTicks;
++                        // CraftBukkit end
++                        this.hurtTicks = this.av = 10;
++                        if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.full.commit", "raw", f);
+                     }
+-                    // CraftBukkit end
+-                    this.lastDamage = f;
+-                    flag = false;
+-                } else {
++
+                     // CraftBukkit start
+-                    float previousHealth = this.getHealth();
+-                    if (!this.d(damagesource, f)) {
+-                        return false;
++                    if(this instanceof EntityAnimal){
++                        ((EntityAnimal)this).cq();
++                        if(this instanceof EntityTameableAnimal){
++                            ((EntityTameableAnimal)this).getGoalSit().setSitting(false);
++                        }
+                     }
+-                    this.lastDamage = f;
+-                    this.noDamageTicks = this.maxNoDamageTicks;
+                     // CraftBukkit end
+-                    this.hurtTicks = this.av = 10;
+-                }
+ 
+-                // CraftBukkit start
+-                if(this instanceof EntityAnimal){
+-                    ((EntityAnimal)this).cq();
+-                    if(this instanceof EntityTameableAnimal){
+-                        ((EntityTameableAnimal)this).getGoalSit().setSitting(false);
+-                    }
+-                }
+-                // CraftBukkit end
++                    this.aw = 0.0F;
++                    Entity entity = damagesource.getEntity();
+ 
+-                this.aw = 0.0F;
+-                Entity entity = damagesource.getEntity();
+-
+-                if (entity != null) {
+-                    if (entity instanceof EntityLiving) {
+-                        this.b((EntityLiving) entity);
+-                    }
+-
+-                    if (entity instanceof EntityHuman) {
+-                        this.lastDamageByPlayerTime = 100;
+-                        this.killer = (EntityHuman) entity;
+-                    } else if (entity instanceof EntityWolf) {
+-                        EntityWolf entitywolf = (EntityWolf) entity;
++                    if (entity != null) {
++                        if (entity instanceof EntityLiving) {
++                            this.b((EntityLiving) entity);
++                        }
+ 
+-                        if (entitywolf.isTamed()) {
++                        if (entity instanceof EntityHuman) {
+                             this.lastDamageByPlayerTime = 100;
+-                            this.killer = null;
++                            this.killer = (EntityHuman) entity;
++                        } else if (entity instanceof EntityWolf) {
++                            EntityWolf entitywolf = (EntityWolf) entity;
++
++                            if (entitywolf.isTamed()) {
++                                this.lastDamageByPlayerTime = 100;
++                                this.killer = null;
++                            }
+                         }
+                     }
+-                }
+ 
+-                // PaperSpigot start - Disable explosion knockback
+-                boolean knockbackCancelled = false;
+-                if (flag && !(knockbackCancelled = world.paperSpigotConfig.disableExplosionKnockback && damagesource.isExplosion() && this instanceof EntityHuman)) {
+-                // PaperSpigot end
+-                    this.world.broadcastEntityEffect(this, (byte) 2);
+-                    if (damagesource != DamageSource.DROWN) {
+-                        this.ac();
+-                    }
++                    // PaperSpigot start - Disable explosion knockback
++                    boolean knockbackCancelled = false;
++                    if (flag && !(knockbackCancelled = world.paperSpigotConfig.disableExplosionKnockback && damagesource.isExplosion() && this instanceof EntityHuman)) {
++                    // PaperSpigot end
++                        this.world.broadcastEntityEffect(this, (byte) 2);
++                        if (damagesource != DamageSource.DROWN) {
++                            this.ac();
++                        }
+ 
+-                    if (entity != null) {
+-                        double d0 = entity.locX - this.locX;
++                        if (entity != null) {
++                            double d0 = entity.locX - this.locX;
+ 
+-                        double d1;
++                            double d1;
+ 
+-                        for (d1 = entity.locZ - this.locZ; d0 * d0 + d1 * d1 < 1.0E-4D; d1 = (Math.random() - Math.random()) * 0.01D) {
+-                            d0 = (Math.random() - Math.random()) * 0.01D;
+-                        }
++                            for (d1 = entity.locZ - this.locZ; d0 * d0 + d1 * d1 < 1.0E-4D; d1 = (Math.random() - Math.random()) * 0.01D) {
++                                d0 = (Math.random() - Math.random()) * 0.01D;
++                            }
+ 
+-                        this.aw = (float) (MathHelper.b(d1, d0) * 180.0D / 3.1415927410125732D - (double) this.yaw);
+-                        this.a(entity, f, d0, d1);
+-                    } else {
+-                        this.aw = (float) ((int) (Math.random() * 2.0D) * 180);
++                            this.aw = (float) (MathHelper.b(d1, d0) * 180.0D / 3.1415927410125732D - (double) this.yaw);
++                            this.a(entity, f, d0, d1);
++                        } else {
++                            this.aw = (float) ((int) (Math.random() * 2.0D) * 180);
++                        }
+                     }
+-                }
+ 
+-                if (knockbackCancelled) this.world.broadcastEntityEffect(this, (byte) 2); // PaperSpigot
++                    if (knockbackCancelled) this.world.broadcastEntityEffect(this, (byte) 2); // PaperSpigot
+ 
+-                String s;
++                    String s;
+ 
+-                if (this.getHealth() <= 0.0F) {
+-                    s = this.bp();
+-                    if (flag && s != null) {
+-                        this.makeSound(s, this.bB(), this.bC());
+-                    }
++                    if (this.getHealth() <= 0.0F) {
++                        s = this.bp();
++                        if (flag && s != null) {
++                            this.makeSound(s, this.bB(), this.bC());
++                        }
+ 
+-                    this.die(damagesource);
+-                } else {
+-                    s = this.bo();
+-                    if (flag && s != null) {
+-                        this.makeSound(s, this.bB(), this.bC());
++                        this.die(damagesource);
++                    } else {
++                        s = this.bo();
++                        if (flag && s != null) {
++                            this.makeSound(s, this.bB(), this.bC());
++                        }
+                     }
+-                }
+ 
+-                return true;
++                    if (CombatTrace.enabled()) CombatTrace.log(damagesource.getEntity(), this, "damage.feedback", "ordinaryHurt", flag);
++                    return CombatTrace.damageResult(this, damagesource, f, true, "living.accepted");
++                }
+             }
++
+         }
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 6fa390a18d705d2ba600dd0935449739aff49a88..b97b2bca5644fe7987b68d6adf9e785ce383c430 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -1,5 +1,7 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import com.google.common.collect.Lists;
+ import com.google.common.collect.Sets;
+ import com.mojang.authlib.GameProfile;
+@@ -498,32 +500,35 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     }
+ 
+     public boolean damageEntity(DamageSource damagesource, float f) {
+-        if (this.isInvulnerable(damagesource)) {
+-            return false;
+-        } else {
+-            boolean flag = this.server.ae() && this.cr() && "fall".equals(damagesource.translationIndex);
+-
+-            if (!flag && this.invulnerableTicks > 0 && damagesource != DamageSource.OUT_OF_WORLD) {
+-                return false;
++        try (CombatTrace.Scope trace = CombatTrace.damage(this, damagesource, f, EntityPlayer.class)) {
++            if (this.isInvulnerable(damagesource)) {
++                return CombatTrace.damageResult(this, damagesource, f, false, "player.invulnerable");
+             } else {
+-                if (damagesource instanceof EntityDamageSource) {
+-                    Entity entity = damagesource.getEntity();
++                boolean flag = this.server.ae() && this.cr() && "fall".equals(damagesource.translationIndex);
+ 
+-                    if (entity instanceof EntityHuman && !this.a((EntityHuman) entity)) {
+-                        return false;
+-                    }
++                if (!flag && this.invulnerableTicks > 0 && damagesource != DamageSource.OUT_OF_WORLD) {
++                    return CombatTrace.damageResult(this, damagesource, f, false, "player.spawn_invulnerability");
++                } else {
++                    if (damagesource instanceof EntityDamageSource) {
++                        Entity entity = damagesource.getEntity();
+ 
+-                    if (entity instanceof EntityArrow) {
+-                        EntityArrow entityarrow = (EntityArrow) entity;
++                        if (entity instanceof EntityHuman && !this.a((EntityHuman) entity)) {
++                            return CombatTrace.damageResult(this, damagesource, f, false, "player.pvp_rejected");
++                        }
++
++                        if (entity instanceof EntityArrow) {
++                            EntityArrow entityarrow = (EntityArrow) entity;
+ 
+-                        if (entityarrow.shooter instanceof EntityHuman && !this.a((EntityHuman) entityarrow.shooter)) {
+-                            return false;
++                            if (entityarrow.shooter instanceof EntityHuman && !this.a((EntityHuman) entityarrow.shooter)) {
++                                return CombatTrace.damageResult(this, damagesource, f, false, "player.arrow_pvp_rejected");
++                            }
+                         }
+                     }
+-                }
+ 
+-                return super.damageEntity(damagesource, f);
++                    return super.damageEntity(damagesource, f);
++                }
+             }
++
+         }
+     }
+ 
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index 9ff04c5016f1b8f339975559b8cf619f1841da82..b90ae6169e04c49236f1eac6052b78368301cf05 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -1,5 +1,7 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import com.google.common.collect.Queues;
+ import com.google.common.util.concurrent.ThreadFactoryBuilder;
+ import io.netty.channel.Channel;
+@@ -182,6 +184,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+         if (this.channel.isOpen()) {
+             // PandaSpigot start - packet limiter
+             if (this.stopReadingPackets) {
++                CombatTrace.network(this.m, packet, "reading_stopped");
+                 return;
+             }
+             if (this.allPacketCounts != null ||
+@@ -191,6 +194,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+                     if (this.allPacketCounts != null) {
+                         this.allPacketCounts.updateAndAdd(1, time);
+                         if (this.allPacketCounts.getRate() >= com.hpfxd.pandaspigot.config.PandaSpigotConfig.get().packetLimiter.getAllPacketsLimit().maxPacketRate) {
++                            CombatTrace.network(this.m, packet, "all_packet_rate");
+                             this.killForPacketSpam();
+                             return;
+                         }
+@@ -208,8 +212,10 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+                         if (counter.getRate() >= packetSpecificLimit.maxPacketRate) {
+                             switch (packetSpecificLimit.violateAction) {
+                                 case DROP:
++                                    CombatTrace.network(this.m, packet, "specific_packet_rate_drop");
+                                     return;
+                                 case KICK:
++                                    CombatTrace.network(this.m, packet, "specific_packet_rate_kick");
+                                     this.killForPacketSpam();
+                                     return;
+                             }
+diff --git a/src/main/java/net/minecraft/server/PlayerConnection.java b/src/main/java/net/minecraft/server/PlayerConnection.java
+index a4c9ee61ca31700b35250cb014f31ffc413cbf8c..5ff2783f5416a56e586785f5bd8e0713505e92a5 100644
+--- a/src/main/java/net/minecraft/server/PlayerConnection.java
++++ b/src/main/java/net/minecraft/server/PlayerConnection.java
+@@ -1,5 +1,7 @@
+ package net.minecraft.server;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import com.google.common.collect.Lists;
+ import com.google.common.primitives.Doubles;
+ import com.google.common.primitives.Floats;
+@@ -1335,93 +1337,103 @@ public class PlayerConnection implements PacketListenerPlayIn, IUpdatePlayerList
+     }
+ 
+     public void a(PacketPlayInUseEntity packetplayinuseentity) {
+-        if (this.player.dead) return; // CraftBukkit
++        if (this.player.dead) {
++            CombatTrace.network(this, packetplayinuseentity, "player_dead");
++            return;
++        } // CraftBukkit
+         PlayerConnectionUtils.ensureMainThread(packetplayinuseentity, this, this.player.u());
+         WorldServer worldserver = this.minecraftServer.getWorldServer(this.player.dimension);
+         Entity entity = packetplayinuseentity.a((World) worldserver);
+-        // Spigot Start
+-        if ( entity == player && !player.isSpectator() )
+-        {
+-            disconnect( "Cannot interact with self!" );
+-            return;
+-        }
+-        // Spigot End
++        try (CombatTrace.Scope trace = CombatTrace.packet(this.player, packetplayinuseentity, entity)) {
++            if (CombatTrace.enabled()) CombatTrace.log(this.player, entity, "connection.target", "resolved", entity != null, "action", String.valueOf(packetplayinuseentity.a()));
++            // Spigot Start
++            if ( entity == player && !player.isSpectator() )
++            {
++                if (CombatTrace.enabled()) CombatTrace.log(this.player, entity, "connection.reject", "reason", "self_target");
++                disconnect( "Cannot interact with self!" );
++                return;
++            }
++            // Spigot End
+ 
+-        this.player.resetIdleTimer();
+-        if (entity != null) {
+-            boolean flag = this.player.hasLineOfSight(entity);
+-            double d0 = 36.0D;
++            this.player.resetIdleTimer();
++            if (entity != null) {
++                boolean flag = this.player.hasLineOfSight(entity);
++                double d0 = 36.0D;
+ 
+-            if (false && !flag) { // PandaSpigot - Fix GH-244: Hit Registration Bug
+-                d0 = 9.0D;
+-            }
++                if (false && !flag) { // PandaSpigot - Fix GH-244: Hit Registration Bug
++                    d0 = 9.0D;
++                }
+ 
+-            if (this.player.h(entity) < d0) {
+-                ItemStack itemInHand = this.player.inventory.getItemInHand(); // CraftBukkit
++                double distanceSquared = this.player.h(entity);
++                if (CombatTrace.enabled()) CombatTrace.log(this.player, entity, "connection.distance", "distanceSquared", distanceSquared, "limitSquared", d0, "accepted", distanceSquared < d0, "lineOfSight", flag);
++                if (distanceSquared < d0) {
++                    ItemStack itemInHand = this.player.inventory.getItemInHand(); // CraftBukkit
+ 
+-                if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT
+-                        || packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT_AT) {
+-                    // CraftBukkit start
+-                    boolean triggerLeashUpdate = itemInHand != null && itemInHand.getItem() == Items.LEAD && entity instanceof EntityInsentient;
+-                    Item origItem = this.player.inventory.getItemInHand() == null ? null : this.player.inventory.getItemInHand().getItem();
+-                    PlayerInteractEntityEvent event;
+-                    if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT) {
+-                        event = new PlayerInteractEntityEvent((Player) this.getPlayer(), entity.getBukkitEntity());
+-                    } else {
+-                        Vec3D target = packetplayinuseentity.b();
+-                        event = new PlayerInteractAtEntityEvent((Player) this.getPlayer(), entity.getBukkitEntity(), new org.bukkit.util.Vector(target.a, target.b, target.c));
+-                    }
+-                    this.server.getPluginManager().callEvent(event);
++                    if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT
++                            || packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT_AT) {
++                        // CraftBukkit start
++                        boolean triggerLeashUpdate = itemInHand != null && itemInHand.getItem() == Items.LEAD && entity instanceof EntityInsentient;
++                        Item origItem = this.player.inventory.getItemInHand() == null ? null : this.player.inventory.getItemInHand().getItem();
++                        PlayerInteractEntityEvent event;
++                        if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT) {
++                            event = new PlayerInteractEntityEvent((Player) this.getPlayer(), entity.getBukkitEntity());
++                        } else {
++                            Vec3D target = packetplayinuseentity.b();
++                            event = new PlayerInteractAtEntityEvent((Player) this.getPlayer(), entity.getBukkitEntity(), new org.bukkit.util.Vector(target.a, target.b, target.c));
++                        }
++                        this.server.getPluginManager().callEvent(event);
+ 
+-                    if (triggerLeashUpdate && (event.isCancelled() || this.player.inventory.getItemInHand() == null || this.player.inventory.getItemInHand().getItem() != Items.LEAD)) {
+-                        // Refresh the current leash state
+-                        this.sendPacket(new PacketPlayOutAttachEntity(1, entity, ((EntityInsentient) entity).getLeashHolder()));
+-                    }
++                        if (triggerLeashUpdate && (event.isCancelled() || this.player.inventory.getItemInHand() == null || this.player.inventory.getItemInHand().getItem() != Items.LEAD)) {
++                            // Refresh the current leash state
++                            this.sendPacket(new PacketPlayOutAttachEntity(1, entity, ((EntityInsentient) entity).getLeashHolder()));
++                        }
+ 
+-                    if (event.isCancelled() || this.player.inventory.getItemInHand() == null || this.player.inventory.getItemInHand().getItem() != origItem) {
+-                        // Refresh the current entity metadata
+-                        this.sendPacket(new PacketPlayOutEntityMetadata(entity.getId(), entity.datawatcher, true));
+-                    }
++                        if (event.isCancelled() || this.player.inventory.getItemInHand() == null || this.player.inventory.getItemInHand().getItem() != origItem) {
++                            // Refresh the current entity metadata
++                            this.sendPacket(new PacketPlayOutEntityMetadata(entity.getId(), entity.datawatcher, true));
++                        }
+ 
+-                    if (event.isCancelled()) {
+-                        return;
++                        if (event.isCancelled()) {
++                            return;
++                        }
++                        // CraftBukkit end
+                     }
+-                    // CraftBukkit end
+-                }
+-                if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT) {
+-                    this.player.u(entity);
++                    if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT) {
++                        this.player.u(entity);
+ 
+-                    // CraftBukkit start
+-                    if (itemInHand != null && itemInHand.count <= -1) {
+-                        this.player.updateInventory(this.player.activeContainer);
+-                    }
+-                    // CraftBukkit end
+-                } else if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT_AT) {
+-                    entity.a((EntityHuman) this.player, packetplayinuseentity.b());
++                        // CraftBukkit start
++                        if (itemInHand != null && itemInHand.count <= -1) {
++                            this.player.updateInventory(this.player.activeContainer);
++                        }
++                        // CraftBukkit end
++                    } else if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.INTERACT_AT) {
++                        entity.a((EntityHuman) this.player, packetplayinuseentity.b());
+ 
+-                    // CraftBukkit start
+-                    if (itemInHand != null && itemInHand.count <= -1) {
+-                        this.player.updateInventory(this.player.activeContainer);
+-                    }
+-                    // CraftBukkit end
+-                } else if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.ATTACK) {
+-                    if (entity instanceof EntityItem || entity instanceof EntityExperienceOrb || entity instanceof EntityArrow || (entity == this.player && !player.isSpectator())) { // CraftBukkit
+-                        this.disconnect("Attempting to attack an invalid entity");
+-                        this.minecraftServer.warning("Player " + this.player.getName() + " tried to attack an invalid entity");
+-                        return;
+-                    }
++                        // CraftBukkit start
++                        if (itemInHand != null && itemInHand.count <= -1) {
++                            this.player.updateInventory(this.player.activeContainer);
++                        }
++                        // CraftBukkit end
++                    } else if (packetplayinuseentity.a() == PacketPlayInUseEntity.EnumEntityUseAction.ATTACK) {
++                        if (entity instanceof EntityItem || entity instanceof EntityExperienceOrb || entity instanceof EntityArrow || (entity == this.player && !player.isSpectator())) { // CraftBukkit
++                            if (CombatTrace.enabled()) CombatTrace.log(this.player, entity, "connection.reject", "reason", "invalid_target", "type", entity.getClass().getName());
++                            this.disconnect("Attempting to attack an invalid entity");
++                            this.minecraftServer.warning("Player " + this.player.getName() + " tried to attack an invalid entity");
++                            return;
++                        }
+ 
+-                    this.player.attack(entity);
++                        this.player.attack(entity);
+ 
+-                    // CraftBukkit start
+-                    if (itemInHand != null && itemInHand.count <= -1) {
+-                        this.player.updateInventory(this.player.activeContainer);
++                        // CraftBukkit start
++                        if (itemInHand != null && itemInHand.count <= -1) {
++                            this.player.updateInventory(this.player.activeContainer);
++                        }
++                        // CraftBukkit end
+                     }
+-                    // CraftBukkit end
+                 }
+             }
+-        }
+ 
++        }
+     }
+ 
+     public void a(PacketPlayInClientCommand packetplayinclientcommand) {
+diff --git a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+index 3e3a04808196e722fd1dcdae638bfcf45a79f4d9..8de1687bbefe11dfdf06e4919ff78269057fb932 100644
+--- a/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
++++ b/src/main/java/org/bukkit/craftbukkit/entity/CraftLivingEntity.java
+@@ -1,5 +1,7 @@
+ package org.bukkit.craftbukkit.entity;
+ 
++import com.hpfxd.pandaspigot.diagnostics.CombatTrace;
++
+ import java.util.ArrayList;
+ import java.util.Collection;
+ import java.util.HashSet;
+@@ -262,6 +264,7 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+     }
+ 
+     public void setLastDamage(double damage) {
++        if (CombatTrace.enabled()) CombatTrace.write(getHandle(), "lastDamage", getHandle().lastDamage, (float) damage, "bukkit.setLastDamage");
+         getHandle().lastDamage = (float) damage;
+     }
+ 
+@@ -270,6 +273,7 @@ public class CraftLivingEntity extends CraftEntity implements LivingEntity {
+     }
+ 
+     public void setNoDamageTicks(int ticks) {
++        if (CombatTrace.enabled()) CombatTrace.write(getHandle(), "noDamageTicks", getHandle().noDamageTicks, ticks, "bukkit.setNoDamageTicks");
+         getHandle().noDamageTicks = ticks;
+     }
+ 
+diff --git a/src/test/java/com/hpfxd/pandaspigot/diagnostics/CombatTraceTest.java b/src/test/java/com/hpfxd/pandaspigot/diagnostics/CombatTraceTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..3d24ddc69c772abf6aa9b42bb256dc2c269f8a0c
+--- /dev/null
++++ b/src/test/java/com/hpfxd/pandaspigot/diagnostics/CombatTraceTest.java
+@@ -0,0 +1,134 @@
++package com.hpfxd.pandaspigot.diagnostics;
++
++import java.util.ArrayList;
++import java.util.Collections;
++import java.util.List;
++import java.util.Map;
++import java.util.UUID;
++import java.util.function.Consumer;
++
++import net.minecraft.server.Entity;
++import net.minecraft.server.EntityLiving;
++import net.minecraft.server.DamageSource;
++import net.minecraft.server.ItemStack;
++import net.minecraft.server.NBTTagCompound;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class CombatTraceTest extends AbstractTestingBase {
++    @Test
++    public void sinkShouldFilterActorsAndNeverChangeEntityState() {
++        FixtureEntity watched = new FixtureEntity();
++        FixtureEntity other = new FixtureEntity();
++        watched.motX = 0.75;
++        List<Map<String, Object>> records = new ArrayList<>();
++        Consumer<Map<String, Object>> sink = records::add;
++        CombatTrace.install(Collections.singleton(watched.getUniqueID()), sink, packet -> 11);
++        try {
++            CombatTrace.log(other, null, "unselected");
++            CombatTrace.log(watched, other, "selected", "reason", "fixture");
++            assertEquals(1, records.size());
++            assertEquals("selected", records.get(0).get("stage"));
++            assertEquals("fixture", records.get(0).get("reason"));
++            assertEquals(0.75, watched.motX, 0);
++            assertFalse(watched.dead);
++            CombatTrace.uninstall(record -> {
++            });
++            assertTrue(CombatTrace.enabled());
++        } finally {
++            CombatTrace.uninstall(sink);
++        }
++        assertFalse(CombatTrace.enabled());
++        assertEquals(0, CombatTrace.currentPacketId());
++    }
++
++    @Test
++    public void failingSinkShouldDisableCaptureWithoutBreakingCaller() {
++        FixtureEntity watched = new FixtureEntity();
++        Consumer<Map<String, Object>> sink = record -> {
++            throw new IllegalStateException("fixture capture failure");
++        };
++        CombatTrace.install(Collections.singleton(watched.getUniqueID()), sink, packet -> 11);
++        try {
++            CombatTrace.log(watched, null, "fixture");
++            assertFalse(CombatTrace.enabled());
++            assertFalse(watched.dead);
++        } finally {
++            CombatTrace.uninstall(sink);
++        }
++    }
++
++    @Test
++    public void nestedDamageShouldRestoreContextWhenOriginalCallThrows() {
++        FixtureLiving watched = new FixtureLiving();
++        List<Map<String, Object>> records = new ArrayList<>();
++        Consumer<Map<String, Object>> sink = records::add;
++        java.util.concurrent.atomic.AtomicLong ids = new java.util.concurrent.atomic.AtomicLong();
++        CombatTrace.install(Collections.singleton(watched.getUniqueID()), sink, object -> ids.incrementAndGet());
++        try {
++            try (CombatTrace.Scope outer = CombatTrace.damage(watched, DamageSource.GENERIC, 1, EntityLiving.class)) {
++                long parent = CombatTrace.currentDamageId();
++                assertTrue(parent > 0);
++                try {
++                    try (CombatTrace.Scope inner = CombatTrace.damage(watched, DamageSource.GENERIC, 2, EntityLiving.class)) {
++                        assertNotEquals(parent, CombatTrace.currentDamageId());
++                        throw new IllegalStateException("original combat failure");
++                    }
++                } catch (IllegalStateException expected) {
++                    assertEquals("original combat failure", expected.getMessage());
++                }
++                assertEquals(parent, CombatTrace.currentDamageId());
++                assertEquals(parent, ((Number) records.get(1).get("parentDamageId")).longValue());
++            }
++            assertEquals(0, CombatTrace.currentDamageId());
++            assertEquals("damage.call.exit", records.get(records.size() - 1).get("stage"));
++        } finally {
++            CombatTrace.uninstall(sink);
++        }
++    }
++
++    private static final class FixtureLiving extends EntityLiving {
++        FixtureLiving() {
++            super(null);
++        }
++
++        @Override
++        public ItemStack bA() {
++            return null;
++        }
++
++        @Override
++        public ItemStack getEquipment(int slot) {
++            return null;
++        }
++
++        @Override
++        public void setEquipment(int slot, ItemStack item) {
++        }
++
++        @Override
++        public ItemStack[] getEquipment() {
++            return new ItemStack[5];
++        }
++    }
++
++    private static final class FixtureEntity extends Entity {
++        FixtureEntity() {
++            super(null);
++        }
++
++        @Override
++        protected void h() {
++        }
++
++        @Override
++        protected void a(NBTTagCompound tag) {
++        }
++
++        @Override
++        protected void b(NBTTagCompound tag) {
++        }
++    }
++}

@@ -50,6 +50,8 @@ chunkUnloadMaxChunksPerTick: 100
 chunkUnloadMaxMillisPerTick: 2.0
 chunkSendMaxChunksPerTick: 256
 chunkSendMaxMillisPerTick: 4.0
+chunkSendMaxBytesPerTick: 262144
+chunkSendMaxPendingBytes: 65536
 ```
 
 All limits must be positive. Login acceptance and delayed reconnects share the
@@ -57,10 +59,20 @@ login budget. Completed asynchronous chunk loads retain their callbacks until
 their main-thread completion runs; synchronous chunk loads still complete
 immediately. Queued automatic unloads share their count and time limits across
 worlds; explicit Bukkit unloads and full saves retain their immediate paths.
-Chunk packets rotate through players, preserve each world's
-`max-bulk-chunks` limit, and send tile entities and tracked entities after the
+Chunk packets prioritize the player's current chunk and its eight neighbors,
+rotate through players, apply each world's `max-bulk-chunks` limit to outer
+chunks, and send tile entities and tracked entities after the
 chunk packet. Budgets are checked between operations; one login, chunk
 completion or packet batch can exceed its time limit.
+
+The byte budget estimates uncompressed full-chunk data and packet headers;
+tile entities and tracked entities are sent afterward and are not included.
+One nearby batch of up to nine chunks per tick may exceed the chunk and byte
+limits; excess bytes are deducted from following ticks before sending resumes.
+One oversized outer chunk can also start a tick so large chunks cannot stall the queue.
+Queued chunks pause while their connection has pending packets, is not writable,
+or exceeds the pending-byte threshold. Other packets keep their existing send
+path. These limits do not impose a compressed Internet bandwidth cap.
 
 ## Using
 You can download the latest pre-built server JAR by clicking the download button below.  

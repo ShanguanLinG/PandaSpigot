@@ -1,0 +1,143 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 24 Oct 2026 16:26:45 +0800
+Subject: [PATCH] Fix large item NBT decoding while retaining book limits
+
+
+diff --git a/src/main/java/net/minecraft/server/PacketDataSerializer.java b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+index 09b8fa11efa326345b3b4eaf952676f4841f8115..49cb2306a95a7e5f6f123d79f3d402629c28b8e3 100644
+--- a/src/main/java/net/minecraft/server/PacketDataSerializer.java
++++ b/src/main/java/net/minecraft/server/PacketDataSerializer.java
+@@ -146,6 +146,10 @@ public class PacketDataSerializer extends ByteBuf {
+     }
+ 
+     public NBTTagCompound h() throws IOException {
++        return this.readNbt(50000L); // PandaSpigot
++    }
++
++    private NBTTagCompound readNbt(long maximumBytes) throws IOException { // PandaSpigot
+         int i = this.readerIndex();
+         byte b0 = this.readByte();
+ 
+@@ -153,7 +157,7 @@ public class PacketDataSerializer extends ByteBuf {
+             return null;
+         } else {
+             this.readerIndex(i);
+-            return NBTCompressedStreamTools.a((DataInput) (new ByteBufInputStream(this)), new NBTReadLimiter(50000L)); // PandaSpigot - Reduce NBT Read Limiter
++            return NBTCompressedStreamTools.a((DataInput) (new ByteBufInputStream(this)), new NBTReadLimiter(maximumBytes)); // PandaSpigot
+         }
+     }
+ 
+@@ -188,7 +192,10 @@ public class PacketDataSerializer extends ByteBuf {
+             short short1 = this.readShort();
+ 
+             itemstack = new ItemStack(Item.getById(short0), b0, short1);
+-            itemstack.setTag(this.h());
++            // PandaSpigot start - Keep the stricter NBT limit for books
++            boolean book = itemstack.getItem() == Items.WRITABLE_BOOK || itemstack.getItem() == Items.WRITTEN_BOOK;
++            itemstack.setTag(this.readNbt(book ? 50000L : 2097152L));
++            // PandaSpigot end
+             // CraftBukkit start
+             if (itemstack.getTag() != null) {
+                 CraftItemStack.setItemMeta(itemstack, CraftItemStack.getItemMeta(itemstack));
+diff --git a/src/test/java/net/minecraft/server/ItemPacketNbtLimitTest.java b/src/test/java/net/minecraft/server/ItemPacketNbtLimitTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7d37e8fa0f798f2dc3a7403a06b7716db1aa897b
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/ItemPacketNbtLimitTest.java
+@@ -0,0 +1,95 @@
++package net.minecraft.server;
++
++import io.netty.buffer.Unpooled;
++import java.io.IOException;
++import org.bukkit.support.AbstractTestingBase;
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class ItemPacketNbtLimitTest extends AbstractTestingBase {
++    @Test
++    public void rightClickPreservesLargeItemNbt() throws IOException {
++        ItemStack item = largeItem(Items.DIAMOND_SWORD);
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            new PacketPlayInBlockPlace(item).b(buffer);
++            PacketPlayInBlockPlace decoded = new PacketPlayInBlockPlace();
++            decoded.a(buffer);
++            assertEquals(item.getTag(), decoded.getItemStack().getTag());
++            assertEquals(0, buffer.readableBytes());
++        } finally {
++            buffer.release();
++        }
++    }
++
++    @Test
++    public void inventoryClickPreservesLargeItemNbt() throws IOException {
++        ItemStack item = largeItem(Items.DIAMOND_SWORD);
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            buffer.writeByte(0);
++            buffer.writeShort(0);
++            buffer.writeByte(0);
++            buffer.writeShort(1);
++            buffer.writeByte(0);
++            buffer.a(item);
++            PacketPlayInWindowClick decoded = new PacketPlayInWindowClick();
++            decoded.a(buffer);
++            assertEquals(item.getTag(), decoded.e().getTag());
++            assertEquals(0, buffer.readableBytes());
++        } finally {
++            buffer.release();
++        }
++    }
++
++    @Test
++    public void booksRetainTheFiftyThousandByteLimit() throws IOException {
++        for (Item book : new Item[]{Items.WRITABLE_BOOK, Items.WRITTEN_BOOK}) {
++            PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++            try {
++                buffer.a(largeItem(book));
++                try {
++                    buffer.i();
++                    fail("Oversized book NBT must be rejected");
++                } catch (RuntimeException expected) {
++                    assertTrue(expected.getMessage().contains("max allowed: 50000"));
++                }
++            } finally {
++                buffer.release();
++            }
++        }
++    }
++
++    @Test
++    public void ordinaryItemsStillHaveABoundedNbtLimit() throws IOException {
++        ItemStack item = new ItemStack(Items.DIAMOND_SWORD);
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.setByteArray("payload", new byte[2097152]);
++        item.setTag(tag);
++        PacketDataSerializer buffer = new PacketDataSerializer(Unpooled.buffer());
++        try {
++            buffer.a(item);
++            try {
++                buffer.i();
++                fail("Item NBT above two mebibytes must be rejected");
++            } catch (RuntimeException expected) {
++                assertTrue(expected.getMessage().contains("max allowed: 2097152"));
++            }
++        } finally {
++            buffer.release();
++        }
++    }
++
++    private static ItemStack largeItem(Item type) {
++        ItemStack item = new ItemStack(type);
++        StringBuilder state = new StringBuilder(27000);
++        for (int i = 0; i < 27000; i++) state.append('x');
++        NBTTagCompound internal = new NBTTagCompound();
++        internal.setString("mythicStateJson", state.toString());
++        NBTTagCompound tag = new NBTTagCompound();
++        tag.set("mythicthepit", internal);
++        item.setTag(tag);
++        return item;
++    }
++}

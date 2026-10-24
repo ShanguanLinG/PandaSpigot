@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Fri, 23 Oct 2026 21:14:44 +0800
+Subject: [PATCH] Reduce repeated chunk tick distance calculations
+
+
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index cab6d3912e47d8b3592a1fde65242bbfd208d33c..30f71322cc0b4ac8f464cada5c2c534738eb83b0 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -620,8 +620,14 @@ public class PlayerChunkMap {
+ 
+         // PandaSpigot start - Alternative Chunk Ticking Selection
+         public boolean hasPlayerMatching(double range, Predicate<EntityPlayer> predicate) {
++            double rangeSquared = range * range;
++            double centerX = this.location.x * 16 + 8;
++            double centerZ = this.location.z * 16 + 8;
+             for (EntityPlayer player : this.b) {
+-                if (predicate.apply(player) && this.location.distanceToSqr(player) < range * range) {
++                if (!predicate.apply(player)) continue;
++                double deltaX = centerX - player.locX;
++                double deltaZ = centerZ - player.locZ;
++                if (deltaX * deltaX + deltaZ * deltaZ < rangeSquared) {
+                     return true;
+                 }
+             }
+diff --git a/src/test/java/net/minecraft/server/ChunkNetworkTest.java b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+index 45fdd97de1e73b1806fa1624fdc0489589b83cd1..f0ee3a852d1ad2a453df2bd477338bb5ff4ec58f 100644
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -18,6 +18,29 @@ import org.junit.Test;
+ import static org.junit.Assert.*;
+ 
+ public class ChunkNetworkTest extends AbstractTestingBase {
++    @Test
++    public void tickSelectionPreservesStrictRangeAndPredicateOrder() throws Exception {
++        PlayerChunkMap.PlayerChunk chunk = allocate(PlayerChunkMap.PlayerChunk.class);
++        ChunkCoordIntPair location = new ChunkCoordIntPair(-2, -1);
++        set(chunk, "location", location);
++        EntityPlayer player = allocate(EntityPlayer.class);
++        player.locX = -8;
++        player.locZ = -8;
++        set(chunk, "b", new ArrayList<>(Arrays.asList(player)));
++        assertFalse(chunk.hasPlayerMatching(16, candidate -> true));
++        player.locX = Math.nextDown(-8D);
++        assertTrue(chunk.hasPlayerMatching(16, candidate -> true));
++        assertFalse(chunk.hasPlayerMatching(16, candidate -> false));
++        assertFalse(chunk.hasPlayerMatching(16, candidate -> {
++            candidate.locX = -8;
++            return true;
++        }));
++        for (double range : new double[]{0, -16, 16, Double.NaN, Double.POSITIVE_INFINITY}) {
++            assertEquals(location.distanceToSqr(player) < range * range,
++                    chunk.hasPlayerMatching(range, candidate -> true));
++        }
++    }
++
+     @Test
+     public void nearbyChunksPrecedeOuterChunksEvenWhileAsyncLoadIsPending() throws Exception {
+         PlayerChunkMap map = allocate(PlayerChunkMap.class);

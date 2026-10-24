@@ -1,0 +1,195 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 24 Oct 2026 22:09:23 +0800
+Subject: [PATCH] Avoid repeated NBT compound lookups
+
+
+diff --git a/src/main/java/net/minecraft/server/NBTTagCompound.java b/src/main/java/net/minecraft/server/NBTTagCompound.java
+index b6da9ecdbdfba215366273831cec7acf7611239c..e7dd4e9b88fda26301eebd313b12cc1c94c55abf 100644
+--- a/src/main/java/net/minecraft/server/NBTTagCompound.java
++++ b/src/main/java/net/minecraft/server/NBTTagCompound.java
+@@ -135,7 +135,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public byte getByte(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0 : ((NBTBase.NBTNumber) this.map.get(s)).f();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).f() : 0;
+         } catch (ClassCastException classcastexception) {
+             return 0;
+         }
+@@ -143,7 +144,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public short getShort(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0 : ((NBTBase.NBTNumber) this.map.get(s)).e();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).e() : 0;
+         } catch (ClassCastException classcastexception) {
+             return 0;
+         }
+@@ -151,7 +153,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public int getInt(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0 : ((NBTBase.NBTNumber) this.map.get(s)).d();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).d() : 0;
+         } catch (ClassCastException classcastexception) {
+             return 0;
+         }
+@@ -159,7 +162,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public long getLong(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0L : ((NBTBase.NBTNumber) this.map.get(s)).c();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).c() : 0L;
+         } catch (ClassCastException classcastexception) {
+             return 0L;
+         }
+@@ -167,7 +171,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public float getFloat(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0.0F : ((NBTBase.NBTNumber) this.map.get(s)).h();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).h() : 0.0F;
+         } catch (ClassCastException classcastexception) {
+             return 0.0F;
+         }
+@@ -175,7 +180,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public double getDouble(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 99) ? 0.0D : ((NBTBase.NBTNumber) this.map.get(s)).g();
++            NBTBase value = this.get(s);
++            return value instanceof NBTBase.NBTNumber ? ((NBTBase.NBTNumber) value).g() : 0.0D;
+         } catch (ClassCastException classcastexception) {
+             return 0.0D;
+         }
+@@ -183,7 +189,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public String getString(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 8) ? "" : ((NBTBase) this.map.get(s)).a_();
++            NBTBase value = this.get(s);
++            return value != null && value.getTypeId() == 8 ? value.a_() : "";
+         } catch (ClassCastException classcastexception) {
+             return "";
+         }
+@@ -191,7 +198,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public byte[] getByteArray(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 7) ? new byte[0] : ((NBTTagByteArray) this.map.get(s)).c();
++            NBTBase value = this.get(s);
++            return value != null && value.getTypeId() == 7 ? ((NBTTagByteArray) value).c() : new byte[0];
+         } catch (ClassCastException classcastexception) {
+             throw new ReportedException(this.a(s, 7, classcastexception));
+         }
+@@ -199,7 +207,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public int[] getIntArray(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 11) ? new int[0] : ((NBTTagIntArray) this.map.get(s)).c();
++            NBTBase value = this.get(s);
++            return value != null && value.getTypeId() == 11 ? ((NBTTagIntArray) value).c() : new int[0];
+         } catch (ClassCastException classcastexception) {
+             throw new ReportedException(this.a(s, 11, classcastexception));
+         }
+@@ -207,7 +216,8 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public NBTTagCompound getCompound(String s) {
+         try {
+-            return !this.hasKeyOfType(s, 10) ? new NBTTagCompound() : (NBTTagCompound) this.map.get(s);
++            NBTBase value = this.get(s);
++            return value != null && value.getTypeId() == 10 ? (NBTTagCompound) value : new NBTTagCompound();
+         } catch (ClassCastException classcastexception) {
+             throw new ReportedException(this.a(s, 10, classcastexception));
+         }
+@@ -215,10 +225,11 @@ public class NBTTagCompound extends NBTBase {
+ 
+     public NBTTagList getList(String s, int i) {
+         try {
+-            if (this.b(s) != 9) {
++            NBTBase value = this.get(s);
++            if (value == null || value.getTypeId() != 9) {
+                 return new NBTTagList();
+             } else {
+-                NBTTagList nbttaglist = (NBTTagList) this.map.get(s);
++                NBTTagList nbttaglist = (NBTTagList) value;
+ 
+                 return nbttaglist.size() > 0 && nbttaglist.f() != i ? new NBTTagList() : nbttaglist;
+             }
+diff --git a/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java b/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..caadc01d1496fff62fee5a568924a4cebba1071f
+--- /dev/null
++++ b/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java
+@@ -0,0 +1,65 @@
++package net.minecraft.server;
++
++import org.junit.Test;
++
++import static org.junit.Assert.*;
++
++public class NBTTagCompoundReadTest {
++    @Test
++    public void numericReadsPreserveAllConversionsAndDefaults() {
++        NBTBase.NBTNumber[] numbers = {
++                new NBTTagByte((byte) -3), new NBTTagShort((short) 258), new NBTTagInt(65537),
++                new NBTTagLong(Long.MAX_VALUE), new NBTTagFloat(-2.75F), new NBTTagDouble(258.75D)
++        };
++        NBTTagCompound tag = new NBTTagCompound();
++        for (NBTBase.NBTNumber number : numbers) {
++            tag.set("value", number);
++            assertEquals(number.f(), tag.getByte("value"));
++            assertEquals(number.e(), tag.getShort("value"));
++            assertEquals(number.d(), tag.getInt("value"));
++            assertEquals(number.c(), tag.getLong("value"));
++            assertEquals(number.h(), tag.getFloat("value"), 0F);
++            assertEquals(number.g(), tag.getDouble("value"), 0D);
++            assertEquals(number.f() != 0, tag.getBoolean("value"));
++        }
++        tag.setString("wrong", "text");
++        for (String key : new String[]{"missing", "wrong"}) {
++            assertEquals(0, tag.getByte(key));
++            assertEquals(0, tag.getShort(key));
++            assertEquals(0, tag.getInt(key));
++            assertEquals(0L, tag.getLong(key));
++            assertEquals(0F, tag.getFloat(key), 0F);
++            assertEquals(0D, tag.getDouble(key), 0D);
++            assertFalse(tag.getBoolean(key));
++        }
++    }
++
++    @Test
++    public void structuredReadsPreserveReferencesAndListTypeChecks() {
++        NBTTagCompound tag = new NBTTagCompound();
++        byte[] bytes = {1, 2};
++        int[] integers = {3, 4};
++        NBTTagCompound child = new NBTTagCompound();
++        NBTTagList list = new NBTTagList();
++        list.add(new NBTTagString("value"));
++        tag.setByteArray("bytes", bytes);
++        tag.setIntArray("integers", integers);
++        tag.set("child", child);
++        tag.set("list", list);
++        tag.setString("text", "value");
++        assertSame(bytes, tag.getByteArray("bytes"));
++        assertSame(integers, tag.getIntArray("integers"));
++        assertSame(child, tag.getCompound("child"));
++        assertSame(list, tag.getList("list", 8));
++        assertEquals(0, tag.getList("list", 3).size());
++        assertEquals("value", tag.getString("text"));
++        for (String key : new String[]{"missing", "text"}) {
++            assertEquals(0, tag.getByteArray(key).length);
++            assertEquals(0, tag.getIntArray(key).length);
++            assertTrue(tag.getCompound(key).isEmpty());
++            assertEquals(0, tag.getList(key, 8).size());
++        }
++        assertEquals("", tag.getString("child"));
++        assertEquals("", tag.getString("missing"));
++    }
++}

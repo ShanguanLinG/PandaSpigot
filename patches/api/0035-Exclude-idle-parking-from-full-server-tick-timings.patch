@@ -1,0 +1,60 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sat, 24 Oct 2026 16:26:45 +0800
+Subject: [PATCH] Exclude idle parking from full server tick timings
+
+
+diff --git a/src/main/java/co/aikar/timings/FullServerTickHandler.java b/src/main/java/co/aikar/timings/FullServerTickHandler.java
+index cb4e7ba8358015914aeb12a96dfe84efe3280de6..b980ed847c842360b18cf173a42a2d21f3e15ed4 100644
+--- a/src/main/java/co/aikar/timings/FullServerTickHandler.java
++++ b/src/main/java/co/aikar/timings/FullServerTickHandler.java
+@@ -73,6 +73,11 @@ public class FullServerTickHandler extends TimingHandler {
+         }
+     }
+ 
++    public void stopTiming(long idleNanos) {
++        if (start != 0) start += idleNanos;
++        stopTiming();
++    }
++
+     boolean isViolated() {
+         return record.curTickTotal > 50000000;
+     }
+diff --git a/src/test/java/co/aikar/timings/FullServerTickHandlerTest.java b/src/test/java/co/aikar/timings/FullServerTickHandlerTest.java
+new file mode 100644
+index 0000000000000000000000000000000000000000..7a8625ece980708bbd0b4bb2fff14f62a344cf1e
+--- /dev/null
++++ b/src/test/java/co/aikar/timings/FullServerTickHandlerTest.java
+@@ -0,0 +1,32 @@
++package co.aikar.timings;
++
++import org.junit.Test;
++import org.junit.After;
++import static org.junit.Assert.*;
++
++public class FullServerTickHandlerTest {
++    private FullServerTickHandler timing;
++
++    @After
++    public void restoreFullServerTick() {
++        TimingsManager.TIMING_MAP.put(FullServerTickHandler.IDENTITY, TimingsManager.FULL_SERVER_TICK);
++        TimingIdentifier.getGroup("Minecraft").handlers.remove(timing);
++    }
++
++    @Test
++    public void idleTimeIsExcludedBeforeTheTickIsRecorded() {
++        timing = new FullServerTickHandler() {
++            @Override public void stopTiming() { assertEquals(150L, start); }
++        };
++        timing.start = 100L;
++        timing.stopTiming(50L);
++    }
++
++    @Test
++    public void disabledTimingDoesNotAcquireAStartTime() {
++        timing = new FullServerTickHandler() {
++            @Override public void stopTiming() { assertEquals(0L, start); }
++        };
++        timing.stopTiming(50L);
++    }
++}

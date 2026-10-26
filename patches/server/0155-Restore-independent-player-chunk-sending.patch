@@ -1,0 +1,398 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Sun, 25 Oct 2026 13:23:20 +0800
+Subject: [PATCH] Restore independent player chunk sending
+
+
+diff --git a/src/main/java/com/hpfxd/pandaspigot/ChunkSendBudget.java b/src/main/java/com/hpfxd/pandaspigot/ChunkSendBudget.java
+deleted file mode 100644
+index 1cd31fa5ded81e22c5f7bd15daca83b9d0cd7116..0000000000000000000000000000000000000000
+--- a/src/main/java/com/hpfxd/pandaspigot/ChunkSendBudget.java
++++ /dev/null
+@@ -1,25 +0,0 @@
+-package com.hpfxd.pandaspigot;
+-
+-public final class ChunkSendBudget {
+-    private int limit;
+-    private int sent;
+-
+-    public void reset(int limit) {
+-        this.sent = Math.max(0, this.sent - this.limit);
+-        this.limit = limit;
+-    }
+-
+-    public boolean hasRemaining() {
+-        return this.sent < this.limit;
+-    }
+-
+-    public boolean acquire(int bytes) {
+-        return this.acquire(bytes, false);
+-    }
+-
+-    public boolean acquire(int bytes, boolean immediate) {
+-        if (!immediate && this.sent > 0 && bytes > this.limit - this.sent) return false;
+-        this.sent += bytes;
+-        return true;
+-    }
+-}
+diff --git a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+index d015c793092618cd6a260887b042e574827e2767..29ccffd08591bee2fc9905abfc6816fb55b95199 100644
+--- a/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
++++ b/src/main/java/com/hpfxd/pandaspigot/config/PandaSpigotConfig.java
+@@ -57,8 +57,7 @@ public class PandaSpigotConfig {
+             if (config.maxLoginsPerTick <= 0 || !Double.isFinite(config.loginMaxMillisPerTick) || config.loginMaxMillisPerTick <= 0
+                     || config.chunkIoMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkIoMaxMillisPerTick) || config.chunkIoMaxMillisPerTick <= 0
+                     || config.chunkUnloadMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkUnloadMaxMillisPerTick) || config.chunkUnloadMaxMillisPerTick <= 0
+-                    || config.chunkSendMaxChunksPerTick <= 0 || !Double.isFinite(config.chunkSendMaxMillisPerTick) || config.chunkSendMaxMillisPerTick <= 0
+-                    || config.chunkSendMaxBytesPerTick <= 0 || config.chunkSendMaxPendingBytes <= 0) {
++                    || config.chunkSendMaxPendingBytes <= 0) {
+                 throw new IllegalArgumentException("Login and chunk work count, time and byte limits must be positive");
+             }
+             // PandaSpigot end
+@@ -159,9 +158,6 @@ public class PandaSpigotConfig {
+     public double chunkIoMaxMillisPerTick = 4.0;
+     public int chunkUnloadMaxChunksPerTick = 100;
+     public double chunkUnloadMaxMillisPerTick = 2.0;
+-    public int chunkSendMaxChunksPerTick = 256;
+-    public double chunkSendMaxMillisPerTick = 4.0;
+-    public int chunkSendMaxBytesPerTick = 262144;
+     public int chunkSendMaxPendingBytes = 65536;
+     // PandaSpigot end
+ }
+diff --git a/src/main/java/net/minecraft/server/EntityPlayer.java b/src/main/java/net/minecraft/server/EntityPlayer.java
+index 881bca0adec9a328d114398622f2ad9b94569c85..81aca094cf7376772a505df7699d5aa40694eb35 100644
+--- a/src/main/java/net/minecraft/server/EntityPlayer.java
++++ b/src/main/java/net/minecraft/server/EntityPlayer.java
+@@ -262,11 +262,11 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+     }
+
+     // PandaSpigot start - Preserve chunk events, packets, tile entities and tracker order
+-    int sendQueuedChunks(int maxChunks, com.hpfxd.pandaspigot.ChunkSendBudget bytes) {
++    int sendQueuedChunks() {
+         ArrayList arraylist = Lists.newArrayList();
+         List<ChunkCoordIntPair> nearby = this.u().getPlayerChunkMap().getPendingNearbyChunks(this);
+         boolean prioritizeNearby = !nearby.isEmpty();
+-        int batchSize = prioritizeNearby ? nearby.size() : Math.min(maxChunks, this.world.spigotConfig.maxBulkChunk);
++        int batchSize = prioritizeNearby ? nearby.size() : this.world.spigotConfig.maxBulkChunk;
+         Iterator iterator1 = (prioritizeNearby ? nearby : this.chunkCoordIntPairQueue).iterator();
+         ArrayList arraylist1 = Lists.newArrayList();
+
+@@ -280,7 +280,6 @@ public class EntityPlayer extends EntityHuman implements ICrafting {
+                 if (this.world.isLoaded(new BlockPosition(chunkcoordintpair.x << 4, 0, chunkcoordintpair.z << 4))) {
+                     chunk = this.world.getChunkAt(chunkcoordintpair.x, chunkcoordintpair.z);
+                     if (chunk.isReady()) {
+-                        if (!bytes.acquire(PacketPlayOutMapChunk.estimatedSize(chunk), prioritizeNearby)) break;
+                         arraylist.add(chunk);
+                         arraylist1.addAll(chunk.tileEntities.values()); // CraftBukkit - Get tile entities directly from the chunk instead of the world
+                         if (prioritizeNearby) this.chunkCoordIntPairQueue.remove(chunkcoordintpair);
+diff --git a/src/main/java/net/minecraft/server/NetworkManager.java b/src/main/java/net/minecraft/server/NetworkManager.java
+index a9ab6d65ab160f4d62f79a7f03d57db85bb7f631..78f48ee69a96cd10882bf56d83dc78c7ac21e22b 100644
+--- a/src/main/java/net/minecraft/server/NetworkManager.java
++++ b/src/main/java/net/minecraft/server/NetworkManager.java
+@@ -144,7 +144,7 @@ public class NetworkManager extends SimpleChannelInboundHandler<Packet> {
+     boolean canSendChunks(int maxPendingBytes) {
+         if (this.channel == null) return false;
+         Channel channel = this.channel.pipeline().channel();
+-        return channel.isActive() && channel.isWritable() && this.i.isEmpty()
++        return channel.isActive() && channel.isWritable()
+             && channel.config().getWriteBufferHighWaterMark() - channel.bytesBeforeUnwritable() < maxPendingBytes;
+     }
+     // PandaSpigot end
+diff --git a/src/main/java/net/minecraft/server/PacketPlayOutMapChunk.java b/src/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+index 9f4e24fd3358da1d9a38d467ceba06a78c701b7a..a0021fb96bac484f69e9d7c5c935c034d56358f9 100644
+--- a/src/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
++++ b/src/main/java/net/minecraft/server/PacketPlayOutMapChunk.java
+@@ -52,16 +52,6 @@ public class PacketPlayOutMapChunk implements Packet<PacketListenerPlayOut> {
+         return j + k + l + i1;
+     }
+
+-    // PandaSpigot start - Budget full chunk payloads before queue removal
+-    static int estimatedSize(Chunk chunk) {
+-        int sections = 0;
+-        for (ChunkSection section : chunk.getSections()) {
+-            if (section != null && !section.a()) sections++;
+-        }
+-        return a(sections, !chunk.world.worldProvider.o(), true) + 32;
+-    }
+-    // PandaSpigot end
+-
+     public static PacketPlayOutMapChunk.ChunkMap a(Chunk chunk, boolean flag, boolean flag1, int i) {
+         ChunkSection[] achunksection = chunk.getSections();
+         PacketPlayOutMapChunk.ChunkMap packetplayoutmapchunk_chunkmap = new PacketPlayOutMapChunk.ChunkMap();
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+index 0a3c5eaa550815f67ef3ac74273c9aa6d71a3405..862e53e0e98ec05c161043b36110226faa07a2d9 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkSendQueue.java
+@@ -1,19 +1,14 @@
+ package net.minecraft.server;
+
+-import com.hpfxd.pandaspigot.TickWorkBudget;
+-import com.hpfxd.pandaspigot.ChunkSendBudget;
+ import com.hpfxd.pandaspigot.config.PandaSpigotConfig;
+
+ import java.util.ArrayList;
+-import java.util.List;
+ import java.util.LinkedHashMap;
+ import java.util.Map;
+ import java.util.UUID;
+
+ public final class PlayerChunkSendQueue {
+     private final Map<UUID, EntityPlayer> pending = new LinkedHashMap<>();
+-    private final TickWorkBudget budget = new TickWorkBudget();
+-    private final ChunkSendBudget bytes = new ChunkSendBudget();
+
+     public void add(EntityPlayer player) {
+         this.pending.put(player.getUniqueID(), player);
+@@ -21,33 +16,13 @@ public final class PlayerChunkSendQueue {
+
+     public void tick(MinecraftServer server) {
+         PandaSpigotConfig config = PandaSpigotConfig.get();
+-        this.budget.reset(config.chunkSendMaxChunksPerTick, (long) (config.chunkSendMaxMillisPerTick * 1_000_000L));
+-        this.bytes.reset(config.chunkSendMaxBytesPerTick);
+-        List<EntityPlayer> players = new ArrayList<>();
+-        List<EntityPlayer> distant = new ArrayList<>();
+-        for (EntityPlayer player : this.pending.values()) {
+-            if (player.u().getPlayerChunkMap().getPendingNearbyChunks(player).isEmpty()) distant.add(player);
+-            else players.add(player);
+-        }
+-        int nearbyPlayers = players.size();
+-        players.addAll(distant);
+-        boolean nearbySent = false;
+-        for (int index = 0; index < players.size(); index++) {
+-            if (!this.budget.hasRemaining() || !this.bytes.hasRemaining()) break;
+-            if (index < nearbyPlayers && nearbySent) continue;
+-            EntityPlayer player = players.get(index);
++        for (EntityPlayer player : new ArrayList<>(this.pending.values())) {
+             this.pending.remove(player.getUniqueID());
+             if (server.getPlayerList().a(player.getUniqueID()) != player || player.playerConnection == null
+                 || !player.playerConnection.networkManager.g() || player.chunkCoordIntPairQueue.isEmpty()) continue;
+-            long started = System.nanoTime();
+-            int sent = 0;
+-            try {
+-                if (player.playerConnection.networkManager.canSendChunks(config.chunkSendMaxPendingBytes))
+-                    sent = player.sendQueuedChunks(this.budget.remaining(), this.bytes);
+-            } finally {
+-                this.budget.record(sent, started);
++            if (player.playerConnection.networkManager.canSendChunks(config.chunkSendMaxPendingBytes)) {
++                player.sendQueuedChunks();
+             }
+-            if (sent > 0 && index < nearbyPlayers) nearbySent = true;
+             if (!player.chunkCoordIntPairQueue.isEmpty()) this.pending.put(player.getUniqueID(), player);
+         }
+     }
+diff --git a/src/test/java/com/hpfxd/pandaspigot/ChunkSendBudgetTest.java b/src/test/java/com/hpfxd/pandaspigot/ChunkSendBudgetTest.java
+deleted file mode 100644
+index 960fe4c03a89f7951882fe39464d26474a3009d3..0000000000000000000000000000000000000000
+--- a/src/test/java/com/hpfxd/pandaspigot/ChunkSendBudgetTest.java
++++ /dev/null
+@@ -1,51 +0,0 @@
+-package com.hpfxd.pandaspigot;
+-
+-import org.junit.Test;
+-
+-import static org.junit.Assert.*;
+-
+-public class ChunkSendBudgetTest {
+-    @Test
+-    public void sharedBudgetRejectsOversizedNextChunkWithoutSpendingItsCredit() {
+-        ChunkSendBudget budget = new ChunkSendBudget();
+-        budget.reset(100);
+-        assertTrue(budget.acquire(60));
+-        assertFalse(budget.acquire(50));
+-        assertTrue(budget.acquire(40));
+-        assertFalse(budget.hasRemaining());
+-    }
+-
+-    @Test
+-    public void firstOversizedChunkMakesProgressAndStopsFurtherSendingUntilNextTick() {
+-        ChunkSendBudget budget = new ChunkSendBudget();
+-        budget.reset(100);
+-        assertTrue(budget.acquire(150));
+-        assertFalse(budget.hasRemaining());
+-        assertFalse(budget.acquire(1));
+-        budget.reset(100);
+-        assertFalse(budget.acquire(100));
+-        assertTrue(budget.acquire(50));
+-        budget.reset(100);
+-        assertTrue(budget.acquire(100));
+-    }
+-
+-    @Test
+-    public void nearbyBatchBorrowsFutureAllowanceAndPausesOuterChunksUntilRepaid() {
+-        ChunkSendBudget budget = new ChunkSendBudget();
+-        budget.reset(100);
+-        assertTrue(budget.acquire(100, true));
+-        assertTrue(budget.acquire(150, true));
+-        assertFalse(budget.hasRemaining());
+-        assertFalse(budget.acquire(1));
+-        budget.reset(100);
+-        assertFalse(budget.hasRemaining());
+-        assertFalse(budget.acquire(1));
+-        budget.reset(100);
+-        assertTrue(budget.hasRemaining());
+-        assertFalse(budget.acquire(51));
+-        assertTrue(budget.acquire(50));
+-        assertFalse(budget.hasRemaining());
+-        budget.reset(100);
+-        assertTrue(budget.acquire(100));
+-    }
+-}
+diff --git a/src/test/java/net/minecraft/server/ChunkNetworkTest.java b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+index d461385074b02eaeff5c7be535940013e36d70bf..bf7b3b7c718f3a3e64322ce8866d9a798d0d2fe1 100644
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -11,8 +11,11 @@ import java.lang.reflect.Field;
+ import java.lang.reflect.Proxy;
+ import java.util.ArrayList;
+ import java.util.Arrays;
++import java.util.HashMap;
+ import java.util.LinkedList;
+ import java.util.List;
++import java.util.Map;
++import java.util.Queue;
+ import java.util.UUID;
+
+ import org.bukkit.support.AbstractTestingBase;
+@@ -77,9 +80,7 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+         worldConfig.setAccessible(true);
+         worldConfig.set(world, config);
+         player.chunkCoordIntPairQueue.remove(adjacent);
+-        com.hpfxd.pandaspigot.ChunkSendBudget budget = new com.hpfxd.pandaspigot.ChunkSendBudget();
+-        budget.reset(131072);
+-        assertEquals(0, player.sendQueuedChunks(2, budget));
++        assertEquals(0, player.sendQueuedChunks());
+         assertEquals(Arrays.asList(outer), player.chunkCoordIntPairQueue);
+
+         set(pending, "loaded", true);
+@@ -94,23 +95,72 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+     }
+
+     @Test
+-    public void chunkEstimateTracksNonEmptySectionsAndSkyLight() throws Exception {
+-        WorldServer world = allocate(WorldServer.class);
+-        world.worldProvider = new WorldProviderNormal();
+-        Chunk chunk = new Chunk(world, 0, 0);
+-        chunk.getSections()[0] = new ChunkSection(0, true);
+-        chunk.getSections()[1] = new ChunkSection(16, true);
+-        chunk.getSections()[1].setType(0, 0, 0, Blocks.STONE.getBlockData());
+-        assertEquals(PacketPlayOutMapChunk.a(chunk, true, true, 65535).a.length + 32,
+-                PacketPlayOutMapChunk.estimatedSize(chunk));
+-        world.worldProvider = new WorldProviderHell() {
+-            @Override
+-            public boolean o() {
+-                return true;
++    public void concurrentJoinsEachSendNearbyChunksWithoutWaitingForOtherPlayers() throws Exception {
++        Field config = PandaSpigotConfig.class.getDeclaredField("config");
++        config.setAccessible(true);
++        Object previous = config.get(null);
++        List<EmbeddedChannel> channels = new ArrayList<>();
++        try {
++            config.set(null, new PandaSpigotConfig());
++            DedicatedServer server = allocate(DedicatedServer.class);
++            DedicatedPlayerList playerList = allocate(DedicatedPlayerList.class);
++            Map<UUID, EntityPlayer> online = new HashMap<>();
++            Field playersById = PlayerList.class.getDeclaredField("j");
++            playersById.setAccessible(true);
++            playersById.set(playerList, online);
++            server.a(playerList);
++            PlayerChunkSendQueue queue = new PlayerChunkSendQueue();
++            List<SendingPlayer> players = new ArrayList<>();
++            PlayerChunkMap map = allocate(PlayerChunkMap.class);
++            LongHashMap<PlayerChunkMap.PlayerChunk> chunks = new LongHashMap<>();
++            set(map, "d", chunks);
++            WorldServer world = allocate(WorldServer.class);
++            set(world, "manager", map);
++            PlayerChunkMap.PlayerChunk center = allocate(PlayerChunkMap.PlayerChunk.class);
++            set(center, "b", players);
++            set(center, "location", new ChunkCoordIntPair(0, 0));
++            set(center, "loaded", true);
++            chunks.put(2147483647L | 2147483647L << 32, center);
++            for (int index = 0; index < 34; index++) {
++                SendingPlayer player = allocate(SendingPlayer.class);
++                player.id = UUID.randomUUID();
++                player.world = world;
++                List<ChunkCoordIntPair> pending = new LinkedList<>();
++                for (int x = -1; x <= 1; x++) {
++                    for (int z = -1; z <= 1; z++) pending.add(new ChunkCoordIntPair(x, z));
++                }
++                Field pendingChunks = EntityPlayer.class.getDeclaredField("chunkCoordIntPairQueue");
++                pendingChunks.setAccessible(true);
++                pendingChunks.set(player, pending);
++                EmbeddedChannel channel = new EmbeddedChannel();
++                channels.add(channel);
++                NetworkManager network = new NetworkManager(EnumProtocolDirection.SERVERBOUND);
++                network.channel = channel;
++                player.playerConnection = allocate(PlayerConnection.class);
++                set(player.playerConnection, "networkManager", network);
++                players.add(player);
++                online.put(player.id, player);
++                queue.add(player);
+             }
+-        };
+-        assertEquals(PacketPlayOutMapChunk.a(chunk, true, false, 65535).a.length + 32,
+-                PacketPlayOutMapChunk.estimatedSize(chunk));
++            channels.get(0).unsafe().outboundBuffer().setUserDefinedWritability(1, false);
++            queue.tick(server);
++            assertEquals(0, players.get(0).sent);
++            for (int index = 1; index < players.size(); index++) assertEquals(9, players.get(index).sent);
++
++            channels.get(0).unsafe().outboundBuffer().setUserDefinedWritability(1, true);
++            queue.tick(server);
++            for (SendingPlayer player : players) assertEquals(9, player.sent);
++
++            SendingPlayer stale = players.get(0);
++            stale.chunkCoordIntPairQueue.add(new ChunkCoordIntPair(0, 0));
++            queue.add(stale);
++            online.put(stale.id, allocate(SendingPlayer.class));
++            queue.tick(server);
++            assertEquals(9, stale.sent);
++        } finally {
++            for (EmbeddedChannel channel : channels) channel.finishAndReleaseAll();
++            config.set(null, previous);
++        }
+     }
+
+     @Test
+@@ -139,6 +189,13 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+             queued.release();
+             assertSame(combat, channel.readOutbound());
+             assertTrue(network.canSendChunks(65536));
++            Field packetQueue = NetworkManager.class.getDeclaredField("i");
++            packetQueue.setAccessible(true);
++            Queue<NetworkManager.QueuedPacket> packets = (Queue<NetworkManager.QueuedPacket>) packetQueue.get(network);
++            packets.add(new NetworkManager.QueuedPacket(combat));
++            assertTrue(network.canSendChunks(65536));
++            assertEquals(1, packets.size());
++            packets.clear();
+         } finally {
+             channel.finishAndReleaseAll();
+             config.set(null, previous);
+@@ -184,6 +241,28 @@ public class ChunkNetworkTest extends AbstractTestingBase {
+         }
+     }
+
++    private static final class SendingPlayer extends EntityPlayer {
++        private UUID id;
++        private int sent;
++
++        private SendingPlayer() {
++            super(null, null, null, null);
++        }
++
++        @Override
++        public UUID getUniqueID() {
++            return this.id;
++        }
++
++        @Override
++        int sendQueuedChunks() {
++            int count = this.chunkCoordIntPairQueue.size();
++            this.sent += count;
++            this.chunkCoordIntPairQueue.clear();
++            return count;
++        }
++    }
++
+     private static void set(Object target, String name, Object value) throws Exception {
+         Field field = target.getClass().getDeclaredField(name);
+         field.setAccessible(true);

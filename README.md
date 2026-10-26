@@ -39,7 +39,8 @@ keep the existing complete save and flush paths.
 
 ### Login and chunk work
 
-`pandaspigot.yml` controls work shared by every player and world:
+`pandaspigot.yml` controls login and chunk I/O work shared by every player and world,
+and the pending-byte threshold for each connection:
 
 ```yaml
 maxLoginsPerTick: 4
@@ -48,9 +49,6 @@ chunkIoMaxChunksPerTick: 64
 chunkIoMaxMillisPerTick: 4.0
 chunkUnloadMaxChunksPerTick: 100
 chunkUnloadMaxMillisPerTick: 2.0
-chunkSendMaxChunksPerTick: 256
-chunkSendMaxMillisPerTick: 4.0
-chunkSendMaxBytesPerTick: 262144
 chunkSendMaxPendingBytes: 65536
 ```
 
@@ -59,20 +57,21 @@ login budget. Completed asynchronous chunk loads retain their callbacks until
 their main-thread completion runs; synchronous chunk loads still complete
 immediately. Queued automatic unloads share their count and time limits across
 worlds; explicit Bukkit unloads and full saves retain their immediate paths.
-Chunk packets prioritize the player's current chunk and its eight neighbors,
-rotate through players, apply each world's `max-bulk-chunks` limit to outer
-chunks, and send tile entities and tracked entities after the
-chunk packet. Budgets are checked between operations; one login, chunk
-completion or packet batch can exceed its time limit.
+Login and chunk I/O budgets are checked between operations; one login or chunk
+completion can exceed its time limit.
 
-The byte budget estimates uncompressed full-chunk data and packet headers;
-tile entities and tracked entities are sent afterward and are not included.
-One nearby batch of up to nine chunks per tick may exceed the chunk and byte
-limits; excess bytes are deducted from following ticks before sending resumes.
-One oversized outer chunk can also start a tick so large chunks cannot stall the queue.
-Queued chunks pause while their connection has pending packets, is not writable,
-or exceeds the pending-byte threshold. Other packets keep their existing send
-path. These limits do not impose a compressed Internet bandwidth cap.
+Each player independently sends one chunk batch per tick, prioritizing their
+current chunk and its eight neighbors. Outer batches use the world's
+`max-bulk-chunks` limit. Tile entities and tracked entities follow their chunk
+packet. Chunk sending has no shared byte, count or time budget, and nearby
+batches do not borrow allowance from later ticks. The former
+`chunkSendMaxChunksPerTick`, `chunkSendMaxMillisPerTick` and
+`chunkSendMaxBytesPerTick` settings no longer control chunk sending.
+Queued chunks pause only for their own inactive or non-writable connection,
+or when it exceeds `chunkSendMaxPendingBytes`. Pending packets retain their
+normal ordering without preventing chunk submission. Other packets keep their
+existing send path. There is no artificial delay between chunk packets and
+their associated updates.
 
 ## Using
 You can download the latest pre-built server JAR by clicking the download button below.  

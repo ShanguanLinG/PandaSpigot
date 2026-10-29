@@ -1,0 +1,222 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 29 Oct 2026 10:14:31 +0800
+Subject: [PATCH] perf: reduce player chunk bookkeeping allocations
+
+
+diff --git a/src/main/java/net/minecraft/server/PlayerChunkMap.java b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+index 30f71322cc0b4ac8f464cada5c2c534738eb83b0..55e8fc56cabaa591c4810cbc93dae86d29d4e224 100644
+--- a/src/main/java/net/minecraft/server/PlayerChunkMap.java
++++ b/src/main/java/net/minecraft/server/PlayerChunkMap.java
+@@ -8,8 +8,7 @@ import com.google.common.collect.Lists;
+ import java.util.ArrayList;
+ import java.util.Iterator;
+ import java.util.List;
+-import java.util.Set; // PandaSpigot
+-import java.util.HashSet; // PandaSpigot
++import java.util.BitSet; // PandaSpigot
+ import org.apache.logging.log4j.LogManager;
+ import org.apache.logging.log4j.Logger;
+ 
+@@ -191,17 +190,28 @@ public class PlayerChunkMap {
+     }
+ 
+     public void b(EntityPlayer entityplayer) {
+-        Set<ChunkCoordIntPair> arraylist = new HashSet<>(entityplayer.chunkCoordIntPairQueue); // PandaSpigot - Only membership is needed while retaining spiral order
+         int i = 0;
+         int j = entityplayer.viewDistance; // PaperSpigot - Player view distance API
+         int k = (int) entityplayer.locX >> 4;
+         int l = (int) entityplayer.locZ >> 4;
++        // PandaSpigot start - Compact membership within the view square, retaining spiral order
++        int diameter = j * 2 + 1;
++        BitSet queued = new BitSet(diameter * diameter);
++        for (ChunkCoordIntPair location : entityplayer.chunkCoordIntPairQueue) {
++            if (location == null) continue;
++            int x = location.x - k + j;
++            int z = location.z - l + j;
++            if (x >= 0 && x < diameter && z >= 0 && z < diameter) {
++                queued.set(x * diameter + z);
++            }
++        }
++        // PandaSpigot end
+         int i1 = 0;
+         int j1 = 0;
+         ChunkCoordIntPair chunkcoordintpair = this.a(k, l, true).location;
+ 
+         entityplayer.chunkCoordIntPairQueue.clear();
+-        if (arraylist.contains(chunkcoordintpair)) {
++        if (queued.get(j * diameter + j)) { // PandaSpigot
+             entityplayer.chunkCoordIntPairQueue.add(chunkcoordintpair);
+         }
+ 
+@@ -215,7 +225,7 @@ public class PlayerChunkMap {
+                     i1 += aint[0];
+                     j1 += aint[1];
+                     chunkcoordintpair = this.a(k + i1, l + j1, true).location;
+-                    if (arraylist.contains(chunkcoordintpair)) {
++                    if (queued.get((i1 + j) * diameter + j1 + j)) { // PandaSpigot
+                         entityplayer.chunkCoordIntPairQueue.add(chunkcoordintpair);
+                     }
+                 }
+@@ -228,7 +238,7 @@ public class PlayerChunkMap {
+             i1 += this.i[i][0];
+             j1 += this.i[i][1];
+             chunkcoordintpair = this.a(k + i1, l + j1, true).location;
+-            if (arraylist.contains(chunkcoordintpair)) {
++            if (queued.get((i1 + j) * diameter + j1 + j)) { // PandaSpigot
+                 entityplayer.chunkCoordIntPairQueue.add(chunkcoordintpair);
+             }
+         }
+@@ -428,6 +438,7 @@ public class PlayerChunkMap {
+             public void run() {
+                 PlayerChunk.this.loaded = true;
+                 PlayerChunk.this.chunk = PlayerChunkMap.this.a().chunkProviderServer.getChunkIfLoaded(PlayerChunk.this.location.x, PlayerChunk.this.location.z); // PandaSpigot - Alternative Chunk Ticking Selection
++                PlayerChunk.this.loadedRunnable = null; // PandaSpigot - Release completed callback
+             }
+         };
+         // CraftBukkit end
+@@ -447,20 +458,18 @@ public class PlayerChunkMap {
+ 
+                 this.b.add(entityplayer);
+                 // CraftBukkit start - use async chunk io
+-                Runnable playerRunnable;
+                 if (this.loaded) {
+-                    playerRunnable = null;
+                     entityplayer.chunkCoordIntPairQueue.add(this.location);
+                 } else {
+-                    playerRunnable = new Runnable() {
++                    Runnable playerRunnable = new Runnable() { // PandaSpigot - Retain only pending callbacks
+                         public void run() {
++                            PlayerChunk.this.players.remove(entityplayer); // PandaSpigot
+                             entityplayer.chunkCoordIntPairQueue.add(PlayerChunk.this.location);
+                         }
+                     };
++                    this.players.put(entityplayer, playerRunnable); // PandaSpigot - Register before a possibly synchronous callback
+                     PlayerChunkMap.this.a().chunkProviderServer.getChunkAt(this.location.x, this.location.z, playerRunnable);
+                 }
+-
+-                this.players.put(entityplayer, playerRunnable);
+                 // CraftBukkit end
+             }
+         }
+diff --git a/src/test/java/net/minecraft/server/ChunkNetworkTest.java b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+index bf7b3b7c718f3a3e64322ce8866d9a798d0d2fe1..6c4c1d49ff0d6ded68148f062f72c329dc969dbe 100644
+--- a/src/test/java/net/minecraft/server/ChunkNetworkTest.java
++++ b/src/test/java/net/minecraft/server/ChunkNetworkTest.java
+@@ -24,6 +24,116 @@ import org.junit.Test;
+ import static org.junit.Assert.*;
+ 
+ public class ChunkNetworkTest extends AbstractTestingBase {
++    @Test
++    public void queueReorderingPreservesSpiralMembershipAcrossViewDistances() throws Exception {
++        for (int distance : new int[]{3, 10, 32}) {
++            PlayerChunkMap map = allocate(PlayerChunkMap.class);
++            LongHashMap<PlayerChunkMap.PlayerChunk> chunks = new LongHashMap<>();
++            set(map, "d", chunks);
++            set(map, "i", new int[][]{{1, 0}, {0, 1}, {-1, 0}, {0, -1}});
++            EntityPlayer player = allocate(EntityPlayer.class);
++            player.viewDistance = distance;
++            player.locX = -32;
++            player.locZ = 16;
++            List<ChunkCoordIntPair> pending = new LinkedList<>();
++            set(player, "chunkCoordIntPairQueue", pending);
++            for (int x = -2 - distance; x <= -2 + distance; x++) {
++                for (int z = 1 - distance; z <= 1 + distance; z++) {
++                    ChunkCoordIntPair location = new ChunkCoordIntPair(x, z);
++                    PlayerChunkMap.PlayerChunk chunk = allocate(PlayerChunkMap.PlayerChunk.class);
++                    set(chunk, "location", location);
++                    chunks.put((long) x + 2147483647L | (long) z + 2147483647L << 32, chunk);
++                    if ((x + z) % 3 != 0) pending.add(location);
++                }
++            }
++            pending.add(pending.get(0));
++            pending.add(null);
++            pending.add(new ChunkCoordIntPair(100, 100));
++            List<ChunkCoordIntPair> expected = new ArrayList<>();
++            expected.add(new ChunkCoordIntPair(-2, 1));
++            for (int radius = 1; radius <= distance; radius++) {
++                for (int z = 1 - radius; z <= radius; z++) expected.add(new ChunkCoordIntPair(-2 + radius, 1 + z));
++                for (int x = radius - 1; x >= -radius; x--) expected.add(new ChunkCoordIntPair(-2 + x, 1 + radius));
++                for (int z = radius - 1; z >= -radius; z--) expected.add(new ChunkCoordIntPair(-2 - radius, 1 + z));
++                for (int x = 1 - radius; x <= radius; x++) expected.add(new ChunkCoordIntPair(-2 + x, 1 - radius));
++            }
++            expected.removeIf(location -> !pending.contains(location));
++            map.b(player);
++            assertEquals(expected, pending);
++            pending.clear();
++            map.b(player);
++            assertTrue(pending.isEmpty());
++        }
++    }
++
++    @Test
++    public void loadedChunksReleasePlayerCallbacksForImmediateAndDelayedLoads() throws Exception {
++        for (int mode = 0; mode < 3; mode++) {
++            PlayerChunkMap map = allocate(PlayerChunkMap.class);
++            WorldServer world = allocate(WorldServer.class);
++            world.worldData = allocate(WorldData.class);
++            CallbackChunkProvider provider = allocate(CallbackChunkProvider.class);
++            provider.callbacks = new ArrayList<>();
++            provider.immediate = mode == 0;
++            world.chunkProviderServer = provider;
++            set(map, "world", world);
++            PlayerChunkMap.PlayerChunk chunk = map.new PlayerChunk(0, 0);
++            Field callbacks = chunk.getClass().getDeclaredField("players");
++            callbacks.setAccessible(true);
++            Map<?, ?> pending = (Map<?, ?>) callbacks.get(chunk);
++            // A pending disk load may complete synchronously during the next registration.
++            if (mode == 2) provider.immediate = true;
++            List<EntityPlayer> players = new ArrayList<>();
++            Field entityId = Entity.class.getDeclaredField("id");
++            entityId.setAccessible(true);
++            for (int index = 0; index < 120; index++) {
++                EntityPlayer player = allocate(EntityPlayer.class);
++                entityId.setInt(player, index);
++                set(player, "chunkCoordIntPairQueue", new LinkedList<ChunkCoordIntPair>());
++                players.add(player);
++                chunk.a(player);
++            }
++            if (mode == 1) {
++                assertEquals(players.size(), pending.size());
++                for (EntityPlayer player : players) assertTrue(player.chunkCoordIntPairQueue.isEmpty());
++                provider.complete();
++            }
++            assertTrue("Only callbacks for unfinished loads should be retained", pending.isEmpty());
++            for (EntityPlayer player : players) {
++                assertEquals(Arrays.asList(new ChunkCoordIntPair(0, 0)), player.chunkCoordIntPairQueue);
++            }
++            Field loadedCallback = chunk.getClass().getDeclaredField("loadedRunnable");
++            loadedCallback.setAccessible(true);
++            assertNull(loadedCallback.get(chunk));
++        }
++    }
++
++    private static final class CallbackChunkProvider extends ChunkProviderServer {
++        private List<Runnable> callbacks;
++        private boolean immediate;
++
++        private CallbackChunkProvider() {
++            super(null, null, null);
++        }
++
++        @Override
++        public Chunk getChunkAt(int x, int z, Runnable callback) {
++            this.callbacks.add(callback);
++            if (this.immediate) this.complete();
++            return null;
++        }
++
++        @Override
++        public Chunk getChunkIfLoaded(int x, int z) {
++            return null;
++        }
++
++        private void complete() {
++            for (Runnable callback : this.callbacks) callback.run();
++            this.callbacks.clear();
++        }
++    }
++
+     @Test
+     public void tickSelectionPreservesStrictRangeAndPredicateOrder() throws Exception {
+         PlayerChunkMap.PlayerChunk chunk = allocate(PlayerChunkMap.PlayerChunk.class);

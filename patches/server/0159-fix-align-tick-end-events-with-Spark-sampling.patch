@@ -1,0 +1,130 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 29 Oct 2026 14:02:14 +0800
+Subject: [PATCH] fix: align tick end events with Spark sampling
+
+
+diff --git a/src/main/java/net/minecraft/server/MinecraftServer.java b/src/main/java/net/minecraft/server/MinecraftServer.java
+index be1dcb1b93c06297f23bc437c59c514f2c273321..21fd000b57755ae6bf5142b7a4cc96115efecddc 100644
+--- a/src/main/java/net/minecraft/server/MinecraftServer.java
++++ b/src/main/java/net/minecraft/server/MinecraftServer.java
+@@ -871,19 +871,23 @@ public abstract class MinecraftServer extends IAsyncTaskHandlerReentrant<TickTas
+ 
+         this.methodProfiler.b();
+         this.methodProfiler.b();
+-        this.mayHaveDelayedTasks = true;
+-        this.delayedTasksMaxNextTickTime = Math.max(getNanoTime() + NANOSECONDS_PER_TICK, this.ab);
+-        this.waitUntilNextTick();
+-        org.spigotmc.WatchdogThread.tick(); // Spigot
+         this.finishTick(i);
+     }
+ 
+     protected void finishTick(long start) {
+-        // PandaSpigot start - Add ServerTickEndEvent
+-        long endTime = getNanoTime();
+-        long duration = endTime - start - this.tickIdleNanos;
+-        this.h[this.ticks % 100] = duration;
+-        new com.destroystokyo.paper.event.server.ServerTickEndEvent(this.ticks, duration / 1000000D, this.ab - endTime).callEvent();
++        // PandaSpigot start - Report the contiguous work interval before idle parking.
++        // Spark infers the sample window from the event time minus this duration.
++        long workEnd = getNanoTime();
++        this.mayHaveDelayedTasks = true;
++        this.delayedTasksMaxNextTickTime = Math.max(workEnd + NANOSECONDS_PER_TICK, this.ab);
++        new com.destroystokyo.paper.event.server.ServerTickEndEvent(this.ticks,
++                (workEnd - start) / 1000000D, this.ab - workEnd).callEvent();
++        // PandaSpigot end
++
++        this.waitUntilNextTick();
++        org.spigotmc.WatchdogThread.tick(); // Spigot
++        // PandaSpigot start - Retain queued work in full-tick accounting without idle time.
++        this.h[this.ticks % 100] = getNanoTime() - start - this.tickIdleNanos;
+         // PandaSpigot end
+         co.aikar.timings.TimingsManager.FULL_SERVER_TICK.stopTiming(this.tickIdleNanos); // Spigot
+     }
+diff --git a/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java b/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
+index ffde27d7158ef32ea5fb9fab58b2353d4bb9edec..4cc38dae55f1b3af8f193b0df0836f573e37992e 100644
+--- a/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
++++ b/src/test/java/net/minecraft/server/NetworkTickBoundaryTest.java
+@@ -66,6 +66,20 @@ public class NetworkTickBoundaryTest {
+ 
+     @Test
+     public void tickDurationIncludesQueuedWorkAndNestedWaitsButExcludesIdleParking() throws Exception {
++        assertTickAccounting(30000000L, 20000000L, 30000000L);
++    }
++
++    @Test
++    public void lateQueuedWorkRemainsInFullTickAccounting() throws Exception {
++        assertTickAccounting(5000000L, 15000000L, 30000000L);
++    }
++
++    @Test
++    public void overrunningTickReportsItsWholeWorkInterval() throws Exception {
++        assertTickAccounting(60000000L, 0, 0);
++    }
++
++    private void assertTickAccounting(long mainWork, long idleWait, long queuedWork) throws Exception {
+         TestServer server = server();
+         SimplePluginManager manager = new SimplePluginManager(null, null);
+         Server previous = Bukkit.getServer();
+@@ -76,23 +90,36 @@ public class NetworkTickBoundaryTest {
+                     throw new UnsupportedOperationException(method.getName());
+                 });
+         set(Bukkit.class, null, "server", proxy);
++        Field watchdog = org.spigotmc.WatchdogThread.class.getDeclaredField("instance");
++        watchdog.setAccessible(true);
++        Object previousWatchdog = watchdog.get(null);
++        watchdog.set(null, allocate(org.spigotmc.WatchdogThread.class));
+         try (EventRecorder recorder = new EventRecorder(ServerTickEndEvent.getHandlerList())) {
+-            set(MinecraftServer.class, server, "waitingForNextTick", true);
+-            server.clockStep = 10000000L;
+-            server.waitForTasks();
+-            server.clockStep = 0;
+-            server.now = 20000000L;
+-            server.schedule(new TickTask(0, () -> {
+-                server.clockStep = 10000000L;
++            server.now = mainWork;
++            server.waitAction = () -> {
++                assertEquals("Tick end must be reported before idle parking", 1, recorder.events.size());
++                ServerTickEndEvent event = (ServerTickEndEvent) recorder.events.get(0);
++                assertEquals(mainWork / 1000000D, event.getTickDuration(), 0D);
++                assertEquals("Spark must infer the actual work start", 0L,
++                        server.now - (long) (event.getTickDuration() * 1000000D));
++                server.clockStep = idleWait;
+                 server.waitForTasks();
+                 server.clockStep = 0;
+-                server.now += 30000000L;
+-            }));
+-            server.runAllTasks();
++                server.now = mainWork + idleWait;
++                server.schedule(new TickTask(0, () -> {
++                    server.clockStep = queuedWork;
++                    server.waitForTasks();
++                    server.clockStep = 0;
++                }));
++                server.runAllTasks();
++            };
++            set(MinecraftServer.class, server, "waitingForNextTick", true);
+             server.finishTick(0);
+-            assertEquals(50000000L, server.h[0]);
+-            assertEquals(50D, ((ServerTickEndEvent) recorder.events.get(0)).getTickDuration(), 0D);
++            assertEquals(mainWork + queuedWork, server.h[0]);
++            assertEquals(mainWork + idleWait + queuedWork, server.now);
++            assertEquals("Exactly one event is emitted per tick", 1, recorder.events.size());
+         } finally {
++            watchdog.set(null, previousWatchdog);
+             set(Bukkit.class, null, "server", previous);
+         }
+     }
+@@ -122,10 +149,12 @@ public class NetworkTickBoundaryTest {
+         private Thread thread;
+         private long now;
+         private long clockStep;
++        private Runnable waitAction;
+         private TestServer() { super(null); }
+         @Override public Thread aM() { return thread; }
+         @Override public long getNanoTime() { long value = now; now += clockStep; return value; }
+         @Override protected boolean shouldRun(TickTask task) { return true; }
++        @Override protected void waitUntilNextTick() { waitAction.run(); }
+     }
+ 
+     private static class TestConnection extends PlayerConnection {

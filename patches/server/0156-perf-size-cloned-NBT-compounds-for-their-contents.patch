@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ShanguanLinG <bilibiliShanguanLinG@outlook.com>
+Date: Thu, 29 Oct 2026 09:03:06 +0800
+Subject: [PATCH] perf: size cloned NBT compounds for their contents
+
+
+diff --git a/src/main/java/net/minecraft/server/NBTTagCompound.java b/src/main/java/net/minecraft/server/NBTTagCompound.java
+index e7dd4e9b88fda26301eebd313b12cc1c94c55abf..8593cc8e5cf74c72524e1df0f78a1832b25e2659 100644
+--- a/src/main/java/net/minecraft/server/NBTTagCompound.java
++++ b/src/main/java/net/minecraft/server/NBTTagCompound.java
+@@ -11,9 +11,17 @@ import java.util.concurrent.Callable;
+ 
+ public class NBTTagCompound extends NBTBase {
+ 
+-    private Map<String, NBTBase> map = Maps.newHashMap();
++    private Map<String, NBTBase> map;
+ 
+-    public NBTTagCompound() {}
++    public NBTTagCompound() {
++        this.map = Maps.newHashMap();
++    }
++
++    // PandaSpigot start - Allocate cloned compounds for their known entry count
++    private NBTTagCompound(int size) {
++        this.map = Maps.newHashMapWithExpectedSize(size);
++    }
++    // PandaSpigot end
+ 
+     @Override
+     void write(DataOutput dataoutput) throws IOException {
+@@ -294,7 +302,7 @@ public class NBTTagCompound extends NBTBase {
+ 
+     @Override
+     public NBTBase clone() {
+-        NBTTagCompound nbttagcompound = new NBTTagCompound();
++        NBTTagCompound nbttagcompound = new NBTTagCompound(this.map.size()); // PandaSpigot
+ 
+         // PandaSpigot start
+         for (Map.Entry<String, NBTBase> entry : this.map.entrySet()) {
+diff --git a/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java b/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java
+index caadc01d1496fff62fee5a568924a4cebba1071f..7a5e4694e5b46737df6cd5a6dc94dff20ee54b51 100644
+--- a/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java
++++ b/src/test/java/net/minecraft/server/NBTTagCompoundReadTest.java
+@@ -5,6 +5,30 @@ import org.junit.Test;
+ import static org.junit.Assert.*;
+ 
+ public class NBTTagCompoundReadTest {
++    @Test
++    public void clonesKeepNestedTagsIndependent() {
++        NBTTagCompound original = new NBTTagCompound();
++        NBTTagCompound child = new NBTTagCompound();
++        child.setByteArray("bytes", new byte[]{1, 2});
++        NBTTagList list = new NBTTagList();
++        list.add(child);
++        original.set("items", list);
++        for (int index = 0; index < 48; index++) {
++            original.setString("entry" + index, "value" + index);
++        }
++
++        NBTTagCompound copy = (NBTTagCompound) original.clone();
++        assertEquals(original, copy);
++        assertEquals(original.hashCode(), copy.hashCode());
++        copy.getList("items", 10).get(0).getByteArray("bytes")[0] = 3;
++        copy.remove("entry0");
++        copy.setString("added", "value");
++        assertEquals(1, child.getByteArray("bytes")[0]);
++        assertTrue(original.hasKey("entry0"));
++        assertFalse(original.hasKey("added"));
++        assertEquals(new NBTTagCompound(), new NBTTagCompound().clone());
++    }
++
+     @Test
+     public void numericReadsPreserveAllConversionsAndDefaults() {
+         NBTBase.NBTNumber[] numbers = {
